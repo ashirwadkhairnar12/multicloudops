@@ -10,22 +10,18 @@ from typing import Dict
 
 logger = logging.getLogger(__name__)
 
-# In-memory cache: account_id → {data, fetched_at}
 _cache: Dict[str, dict] = {}
-# Cost Explorer cache (separate — much longer TTL)
-_cost_cache: Dict[str, dict] = {}
 
-COST_CACHE_TTL = 3600   # 1 hour — Cost Explorer costs $0.01/request
-DATA_CACHE_TTL = 60     # 1 minute minimum between full refreshes
+COST_CACHE_TTL = 3600
+DATA_CACHE_TTL = 60
 
 
 async def poll_account(account_dict: dict) -> dict:
     """
     Poll a single AWS account. Uses cache to avoid excessive API calls.
-    Returns collected data dict.
+    Normalises regions to JSON string before passing to collector.
     """
-    from services.cloud.aws_collector import collect_all, collect_costs, _boto_session
-    import json
+    from services.cloud.aws_collector import collect_all
 
     account_id = account_dict.get("account_id") or account_dict.get("id")
     now = datetime.now(timezone.utc)
@@ -39,23 +35,32 @@ async def poll_account(account_dict: dict) -> dict:
             logger.debug(f"Cache hit for {account_id} (age={age:.0f}s)")
             return cached["data"]
 
-    # Run collection in thread (boto3 is sync)
+    # Normalise regions — collector expects a JSON string OR list (collector handles both)
+    normalised = dict(account_dict)
+    if isinstance(normalised.get("regions"), list):
+        normalised["regions"] = json.dumps(normalised["regions"])
+
     loop = asyncio.get_event_loop()
     try:
-        data = await loop.run_in_executor(None, collect_all, account_dict)
+        data = await loop.run_in_executor(None, collect_all, normalised)
         _cache[account_id] = {"data": data, "fetched_at": now}
         return data
     except Exception as e:
         logger.error(f"Poll failed for account {account_id}: {e}")
-        return {"account_id": account_id, "resources": [], "errors": [str(e)],
-                "costs": {}, "ssm": [], "security": [], "optimisations": []}
+        return {
+            "account_id":    account_id,
+            "resources":     [],
+            "errors":        [str(e)],
+            "costs":         {},
+            "ssm":           [],
+            "security":      [],
+            "optimisations": [],
+        }
 
 
 async def background_poller(get_accounts_fn, on_result_fn, interval: int = 300):
     """
     Continuous background loop: poll all active accounts every `interval` seconds.
-    get_accounts_fn: async callable that returns list of account dicts
-    on_result_fn:    async callable(account_id, result) called after each poll
     """
     logger.info(f"Cloud poller started (interval={interval}s)")
     while True:

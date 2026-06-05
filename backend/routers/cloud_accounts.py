@@ -164,10 +164,19 @@ async def trigger_sync(account_id: str, db: AsyncSession = Depends(get_db)):
     import asyncio
     from services.cloud.poller import poll_account
 
-    acc_dict = account.to_dict()
-    acc_dict["access_key"] = account.access_key
-    acc_dict["secret_key"] = account.secret_key
-    acc_dict["role_arn"]   = account.role_arn
+    # Pass raw fields so regions stays as JSON string (aws_collector handles both formats)
+    acc_dict = {
+        "id":           account.id,
+        "name":         account.name,
+        "provider":     account.provider,
+        "account_id":   account.account_id,
+        "regions":      account.regions,      # raw JSON string from DB
+        "access_key":   account.access_key,
+        "secret_key":   account.secret_key,
+        "role_arn":     account.role_arn,
+        "poll_interval":account.poll_interval,
+        "status":       account.status,
+    }
 
     data = await poll_account(acc_dict)
 

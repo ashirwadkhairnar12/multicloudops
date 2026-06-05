@@ -514,7 +514,14 @@ def collect_all(account: dict) -> dict:
     """
     import json
     session  = _boto_session(account)
-    regions  = json.loads(account.get("regions", '["us-east-1"]'))
+    raw_regions = account.get("regions", '["us-east-1"]')
+    if isinstance(raw_regions, list):
+        regions = raw_regions
+    else:
+        try:
+            regions = json.loads(raw_regions)
+        except Exception:
+            regions = ["us-east-1"]
     account_id = account.get("account_id", "")
 
     result = {
