@@ -11,6 +11,7 @@ const PAGE_TITLES = {
   command:        'Incident Command',
   sla:            'SLA Monitoring',
   agents:         'Monitoring Agents',
+  'cloud-accounts': 'Cloud Accounts',
   metrics:        'Metrics Explorer',
   logs:           'Logs',
   anomaly:        'Anomaly Detection',

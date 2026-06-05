@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from core.config import settings
-from routers import monitoring, agents, auth, history, incidents
+from routers import monitoring, agents, auth, history, incidents, cloud_accounts
 from services.ws_manager import manager, metrics_broadcaster
 from db.database import init_db
 
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting MultiCloudOps API — Phase 2...")
+    logger.info("Starting MultiCloudOps API — Phase 3...")
     await init_db()
     task = asyncio.create_task(metrics_broadcaster())
     logger.info("MultiCloudOps API ready.")
@@ -46,11 +46,12 @@ app.include_router(monitoring.router)
 app.include_router(agents.router)
 app.include_router(history.router)
 app.include_router(incidents.router)
+app.include_router(cloud_accounts.router)
 
 
 @app.get("/")
 def root():
-    return {"message": "MultiCloudOps API", "version": settings.APP_VERSION, "phase": "2"}
+    return {"message": "MultiCloudOps API", "version": settings.APP_VERSION, "phase": "3 — Cloud Integrations"}
 
 
 @app.get("/health")

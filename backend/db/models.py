@@ -128,3 +128,40 @@ class Incident(Base):
             "updated": self.updated_at.strftime("%b %d, %I:%M %p") if self.updated_at else "",
             "mttr": mttr,
         }
+
+class CloudAccount(Base):
+    """
+    A connected cloud account (AWS/Azure/GCP).
+    Credentials encrypted at rest in Phase 4 — for now stored as env-referenced strings.
+    """
+    __tablename__ = "cloud_accounts"
+
+    id: Mapped[str]              = mapped_column(String(64), primary_key=True)
+    name: Mapped[str]            = mapped_column(String(128), nullable=False)   # e.g. "Production AWS"
+    provider: Mapped[str]        = mapped_column(String(32), nullable=False)    # AWS | Azure | GCP
+    account_id: Mapped[str]      = mapped_column(String(64), default="")        # AWS account ID / Azure subscription
+    regions: Mapped[str]         = mapped_column(Text, default="[]")            # JSON list of regions to poll
+    access_key: Mapped[str]      = mapped_column(String(256), default="")       # encrypted in Phase 4
+    secret_key: Mapped[str]      = mapped_column(String(512), default="")       # encrypted in Phase 4
+    role_arn: Mapped[str]        = mapped_column(String(256), default="")       # optional IAM role ARN
+    status: Mapped[str]          = mapped_column(String(32), default="pending") # pending|active|error
+    last_sync: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error_msg: Mapped[str]       = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    poll_interval: Mapped[int]   = mapped_column(Integer, default=300)          # seconds between polls
+
+    def to_dict(self):
+        import json
+        return {
+            "id":            self.id,
+            "name":          self.name,
+            "provider":      self.provider,
+            "account_id":    self.account_id,
+            "regions":       json.loads(self.regions) if self.regions else [],
+            "status":        self.status,
+            "last_sync":     self.last_sync.isoformat() if self.last_sync else None,
+            "error_msg":     self.error_msg,
+            "created_at":    self.created_at.isoformat() if self.created_at else None,
+            "poll_interval": self.poll_interval,
+            "has_credentials": bool(self.access_key or self.role_arn),
+        }

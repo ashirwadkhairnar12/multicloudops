@@ -4,9 +4,9 @@ import Header from '@/components/layout/Header'
 import LoginPage from '@/pages/LoginPage'
 import useStore from '@/store/useStore'
 import useAuthStore from '@/store/useAuthStore'
+import useCloudStore from '@/store/useCloudStore'
 import { useWebSocket } from '@/hooks/useWebSocket'
 
-// Pages
 import OverviewPage         from '@/pages/OverviewPage'
 import InfrastructurePage   from '@/pages/InfrastructurePage'
 import AlertsPage           from '@/pages/AlertsPage'
@@ -17,30 +17,34 @@ import AnomalyPage          from '@/pages/AnomalyPage'
 import CapacityPage         from '@/pages/CapacityPage'
 import ExecutivePage        from '@/pages/ExecutivePage'
 import AgentsPage           from '@/pages/AgentsPage'
+import CloudAccountsPage    from '@/pages/CloudAccountsPage'
 import PlaceholderPage      from '@/pages/PlaceholderPage'
 
 const PAGE_MAP = {
-  overview:       <OverviewPage />,
-  infrastructure: <InfrastructurePage />,
-  alerts:         <AlertsPage />,
-  dashboards:     <ExecutivePage />,
-  incidents:      <IncidentsPage />,
-  command:        <IncidentCommandPage />,
-  sla:            <SLAPage />,
-  anomaly:        <AnomalyPage />,
-  capacity:       <CapacityPage />,
-  agents:         <AgentsPage />,
-  metrics:        <PlaceholderPage title="Metrics Explorer"    phase="Phase 3" />,
-  logs:           <PlaceholderPage title="Log Management"      phase="Phase 3" />,
-  remediation:    <PlaceholderPage title="Auto-Remediation"    phase="Phase 4" />,
-  reports:        <PlaceholderPage title="Reports & Analytics" phase="Phase 3" />,
-  integrations:   <PlaceholderPage title="Integrations"        phase="Phase 3" />,
-  settings:       <PlaceholderPage title="Settings"            phase="Phase 3" />,
+  overview:        <OverviewPage />,
+  infrastructure:  <InfrastructurePage />,
+  alerts:          <AlertsPage />,
+  dashboards:      <ExecutivePage />,
+  incidents:       <IncidentsPage />,
+  command:         <IncidentCommandPage />,
+  sla:             <SLAPage />,
+  anomaly:         <AnomalyPage />,
+  capacity:        <CapacityPage />,
+  'cloud-accounts':<CloudAccountsPage />,
+  agents:          <AgentsPage />,
+  logs:            <PlaceholderPage title="Log Management"      phase="Phase 4" />,
+  remediation:     <PlaceholderPage title="Auto-Remediation"    phase="Phase 4" />,
+  reports:         <PlaceholderPage title="Reports & Analytics" phase="Phase 4" />,
+  integrations:    <PlaceholderPage title="Integrations"        phase="Phase 4" />,
+  settings:        <PlaceholderPage title="Settings"            phase="Phase 4" />,
 }
 
 function Dashboard() {
   const { activeNav } = useStore()
+  const { fetchAccounts } = useCloudStore()
   useWebSocket()
+  useEffect(() => { fetchAccounts() }, [])
+
   return (
     <div className="flex h-screen overflow-hidden bg-bg-primary">
       <Sidebar />
@@ -56,7 +60,6 @@ function Dashboard() {
 
 export default function App() {
   const { user, loading, init } = useAuthStore()
-
   useEffect(() => { init() }, [])
 
   if (loading) {
