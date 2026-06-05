@@ -1,0 +1,121 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MultiCloudOps — Docker Compose
+#
+#  Usage:
+#    docker compose up --build          # first run (builds images)
+#    docker compose up -d               # background
+#    docker compose down                # stop & remove containers
+#    docker compose down -v             # also delete volumes (wipes DB)
+#    docker compose logs -f backend     # tail backend logs
+#
+#  Access:
+#    Dashboard  →  http://localhost
+#    API docs   →  http://localhost:8000/docs
+#    API health →  http://localhost:8000/health
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Backend (FastAPI) ───────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mco-backend
+    restart: unless-stopped
+    environment:
+      APP_NAME: "MultiCloudOps API"
+      APP_VERSION: "2.0.0"
+      DEBUG: "false"
+      DATABASE_URL: "sqlite+aiosqlite:////data/multicloudops.db"
+      REDIS_URL: "redis://redis:6379"
+      MOCK_MODE: "true"
+      AGENT_HEARTBEAT_INTERVAL: "30"
+      AGENT_OFFLINE_THRESHOLD: "90"
+      METRICS_BROADCAST_INTERVAL: "5"
+      SECRET_KEY: "change-me-in-production"
+      # CORS: passed as plain env vars, validator parses the JSON array
+      CORS_ORIGINS: '["http://localhost","http://localhost:80","http://127.0.0.1","http://frontend","http://frontend:80"]'
+    volumes:
+      - backend-data:/data        # SQLite database persistence
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - mco-net
+
+  # ── Frontend (React + Nginx) ────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: mco-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - mco-net
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: mco-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - mco-net
+
+  # ── Demo Agent (optional) ───────────────────────────────────────────────────
+  # Uncomment after registering an agent in the dashboard and pasting its key:
+  #
+  # agent-demo:
+  #   build:
+  #     context: ./agent
+  #     dockerfile: Dockerfile
+  #   container_name: mco-agent-demo
+  #   restart: unless-stopped
+  #   environment:
+  #     MCO_SERVER: "http://backend:8000"
+  #     MCO_API_KEY: "PASTE_YOUR_KEY_HERE"
+  #     MCO_INTERVAL: "15"
+  #     MCO_PROVIDER: "Docker"
+  #     MCO_REGION: "local"
+  #     MCO_SERVER_NAME: "demo-container"
+  #     MCO_SERVER_ID: "demo-001"
+  #   depends_on:
+  #     backend:
+  #       condition: service_healthy
+  #   networks:
+  #     - mco-net
+
+# ── Volumes ──────────────────────────────────────────────────────────────────
+volumes:
+  backend-data:
+    driver: local
+  redis-data:
+    driver: local
+
+# ── Networks ─────────────────────────────────────────────────────────────────
+networks:
+  mco-net:
+    driver: bridge

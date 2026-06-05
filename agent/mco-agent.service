@@ -1,0 +1,27 @@
+[Unit]
+Description=MultiCloudOps Monitoring Agent
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mco-agent
+WorkingDirectory=/opt/mco-agent
+
+# ── Edit these two lines ──────────────────────────────────────────────────
+Environment=MCO_SERVER=http://YOUR_DASHBOARD_IP:8000
+Environment=MCO_API_KEY=mco-YOUR_KEY_HERE
+# ─────────────────────────────────────────────────────────────────────────
+
+Environment=MCO_INTERVAL=30
+Environment=MCO_PROVIDER=On-Prem
+Environment=MCO_REGION=local
+
+ExecStart=/opt/mco-agent/venv/bin/python /opt/mco-agent/mco_agent.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
