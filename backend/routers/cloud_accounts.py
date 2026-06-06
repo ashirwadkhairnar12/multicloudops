@@ -246,8 +246,30 @@ async def get_account_security(account_id: str, db: AsyncSession = Depends(get_d
     from services.cloud.poller import _cache
     cached = _cache.get(account.account_id or account.id)
     if not cached:
-        return {"findings": [], "message": "No data yet"}
-    return {"findings": cached["data"].get("security", []), "ssm": cached["data"].get("ssm", [])}
+        return {"findings": [], "guardduty": [], "iam_unused_roles": [],
+                "config_non_compliant": [], "cloudtrail_events": [],
+                "ssm": [], "message": "No data yet — trigger a sync first"}
+
+    sec = cached["data"].get("security", {})
+    # Support both old format (list) and new format (dict)
+    if isinstance(sec, list):
+        findings = sec
+        guardduty = config_nc = iam_unused = cloudtrail = []
+    else:
+        findings    = sec.get("securityhub", [])
+        guardduty   = sec.get("guardduty", [])
+        iam_unused  = sec.get("iam_unused_roles", [])
+        config_nc   = sec.get("config_non_compliant", [])
+        cloudtrail  = sec.get("cloudtrail_events", [])
+
+    return {
+        "findings":              findings,
+        "guardduty":             guardduty,
+        "iam_unused_roles":      iam_unused,
+        "config_non_compliant":  config_nc,
+        "cloudtrail_events":     cloudtrail,
+        "ssm":                   cached["data"].get("ssm", []),
+    }
 
 
 @router.get("/{account_id}/optimisations")
