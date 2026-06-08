@@ -179,10 +179,18 @@ export default function ExecutivePage() {
   const optimisations  = getAllOptimisations()
 
   // Unified resources
-  const allResources = useMemo(() => [
-    ...servers.map(s => ({ ...s, _src: 'agent' })),
-    ...cloudResources.map(r => ({ ...r, _src: 'cloud' })),
-  ], [servers, cloudResources])
+  const allResources = useMemo(() => {
+    const seen = new Set()
+    const combined = [
+      ...servers.map(s => ({ ...s, _src: s.agent_id ? 'agent' : 'cloud' })),
+      ...cloudResources.map(r => ({ ...r, _src: 'cloud' })),
+    ]
+    return combined.filter(r => {
+      if (seen.has(r.id)) return false
+      seen.add(r.id)
+      return true
+    })
+  }, [servers, cloudResources])
 
   const total     = allResources.length
   const active    = allResources.filter(r => r.status !== 'stopped')

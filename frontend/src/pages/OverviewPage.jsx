@@ -223,11 +223,20 @@ export default function OverviewPage() {
   const secFindings    = getAllSecurity()
   const optimisations  = getAllOptimisations()
 
-  // Unified resource list: agent servers + cloud resources
-  const allResources = [
-    ...servers.map(s => ({ ...s, _source: 'agent' })),
-    ...cloudResources.map(r => ({ ...r, _source: 'cloud' })),
-  ]
+  // Unified resource list: deduplicate by ID so cloud resources aren't counted twice
+  // (backend /api/servers already includes cloud resources; useCloudStore has them too)
+  const allResources = (() => {
+    const seen = new Set()
+    const combined = [
+      ...servers.map(s => ({ ...s, _source: s.agent_id ? 'agent' : 'cloud' })),
+      ...cloudResources.map(r => ({ ...r, _source: 'cloud' })),
+    ]
+    return combined.filter(r => {
+      if (seen.has(r.id)) return false
+      seen.add(r.id)
+      return true
+    })
+  })()
 
   const hasData = allResources.length > 0
 

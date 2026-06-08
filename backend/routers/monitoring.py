@@ -68,12 +68,13 @@ async def get_servers(
     cloud   = [r for r in _get_cloud_resources()
                if not any(s["id"] == r["id"] for s in servers)]
 
-    if source == "agent":
-        all_resources = servers
-    elif source == "cloud":
+    if source == "cloud":
         all_resources = cloud
-    else:
+    elif source == "all":
         all_resources = servers + cloud
+    else:
+        # Default: agent servers only — cloud resources are fetched separately by the frontend
+        all_resources = servers
 
     if provider and provider != "All":
         all_resources = [s for s in all_resources if s.get("provider") == provider]
