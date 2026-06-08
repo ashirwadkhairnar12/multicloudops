@@ -823,18 +823,40 @@ function SSMTab({ items, accountId }) {
 
       {/* ── Scan result feedback ── */}
       {scanResult && (
-        <div className="bg-green-500/10 border border-green-500/20 rounded-xl p-3 text-xs text-green-400">
-          ✓ {scanResult.message}
+        <div className="bg-green-500/10 border border-green-500/20 rounded-xl p-3 text-xs space-y-2">
+          <p className="text-green-400">✓ {scanResult.message}</p>
           {scanResult.commands?.map(cmd => {
             const st = cmdStatus[cmd.command_id]
+            const statuses = st?.statuses || {}
+            const failures = st?.failures || []
+            const hasFailed = (statuses['Failed'] || 0) + (statuses['DeliveryTimedOut'] || 0) > 0
             return (
-              <span key={cmd.command_id} className="ml-2 text-slate-400">
-                [{cmd.region} · {st ? Object.entries(st.statuses || {}).map(([k,v]) => `${v} ${k}`).join(', ') || 'Pending…' : 'Pending…'}]
-              </span>
+              <div key={cmd.command_id}>
+                <p className={hasFailed ? 'text-yellow-400' : 'text-slate-400'}>
+                  {cmd.region} · {st
+                    ? Object.entries(statuses).map(([k,v]) => `${v} ${k}`).join(', ') || 'Pending…'
+                    : 'Pending…'}
+                </p>
+                {failures.map((f, i) => (
+                  <div key={i} className="mt-1 ml-3 bg-red-500/10 border border-red-500/20 rounded-lg p-2 space-y-1">
+                    <p className="text-red-400 font-mono">{f.instance_id} — {f.status_detail || f.status}</p>
+                    {f.output ? (
+                      <p className="text-slate-400 font-mono whitespace-pre-wrap break-all">{f.output}</p>
+                    ) : (
+                      <div className="text-slate-400 space-y-0.5">
+                        <p>Likely causes:</p>
+                        <p>① Instance profile missing <code className="text-yellow-300">AmazonSSMManagedInstanceCore</code> policy</p>
+                        <p>② No internet / VPC endpoint for <code className="text-yellow-300">ssm.{cmd.region}.amazonaws.com</code></p>
+                        <p>③ SSM Agent version too old — run <code className="text-yellow-300">sudo systemctl restart amazon-ssm-agent</code></p>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
             )
           })}
           {scanResult.errors?.length > 0 && (
-            <p className="text-yellow-400 mt-1">⚠ {scanResult.errors.join(', ')}</p>
+            <p className="text-yellow-400">⚠ {scanResult.errors.join(', ')}</p>
           )}
         </div>
       )}

@@ -443,14 +443,39 @@ async def get_command_status(account_id: str, command_id: str, db: AsyncSession 
             for region in regions:
                 try:
                     ssm_client = session.client("ssm", region_name=region)
-                    resp = ssm_client.list_command_invocations(CommandId=command_id, Details=False)
+                    resp = ssm_client.list_command_invocations(CommandId=command_id, Details=True)
                     invocations = resp.get("CommandInvocations", [])
                     statuses: dict = {}
+                    failures = []
                     for inv in invocations:
                         s = inv.get("Status", "Unknown")
                         statuses[s] = statuses.get(s, 0) + 1
+                        if s in ("Failed", "DeliveryTimedOut", "ExecutionTimedOut", "Cancelled"):
+                            iid = inv.get("InstanceId", "")
+                            detail = inv.get("StatusDetails", s)
+                            # Try to get stderr output for the exact error
+                            output = ""
+                            try:
+                                for cp in inv.get("CommandPlugins", []):
+                                    output = cp.get("Output", "") or cp.get("StandardErrorContent", "")
+                                    if output:
+                                        break
+                            except Exception:
+                                pass
+                            failures.append({
+                                "instance_id":  iid,
+                                "status":       s,
+                                "status_detail": detail,
+                                "output":       output[:500] if output else "",
+                            })
                     if invocations:
-                        return {"command_id": command_id, "region": region, "statuses": statuses, "total": len(invocations)}
+                        return {
+                            "command_id": command_id,
+                            "region":     region,
+                            "statuses":   statuses,
+                            "total":      len(invocations),
+                            "failures":   failures,
+                        }
                 except Exception:
                     continue
         except Exception as e:
