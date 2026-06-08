@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { Activity, Plus, RefreshCw, CheckCircle, Clock, AlertTriangle, XCircle, User, Trash2, ChevronDown } from 'lucide-react'
 import useStore from '@/store/useStore'
+import useAuthStore from '@/store/useAuthStore'
 
 const SEV = {
   critical: 'text-red-400 bg-red-500/10 border-red-500/20',
@@ -18,20 +19,29 @@ const STATUS_ICON = {
 function CreateModal({ onClose, onCreated, servers }) {
   const [form, setForm] = useState({ title: '', severity: 'medium', impact: 'Medium', description: '', server_id: '', assignee: '' })
   const [loading, setLoading] = useState(false)
+  const [error,   setError]   = useState(null)
+  const { getAuthHeader } = useAuthStore()
   const up = (k, v) => setForm(f => ({ ...f, [k]: v }))
 
   const submit = async (e) => {
     e.preventDefault()
     setLoading(true)
+    setError(null)
     try {
       const res = await fetch('/api/incidents', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getAuthHeader() },
         body: JSON.stringify({ ...form, server_name: servers.find(s => s.id === form.server_id)?.name || '' }),
       })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || `Request failed (${res.status})`)
+      }
       await res.json()
       onCreated()
       onClose()
+    } catch (err) {
+      setError(err.message)
     } finally { setLoading(false) }
   }
 
@@ -82,6 +92,9 @@ function CreateModal({ onClose, onCreated, servers }) {
             <textarea value={form.description} onChange={e => up('description', e.target.value)} rows={2}
               className="w-full bg-bg-primary border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500/60 resize-none" />
           </div>
+          {error && (
+            <p className="text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">{error}</p>
+          )}
           <div className="flex gap-3 pt-1">
             <button type="button" onClick={onClose} className="flex-1 py-2 rounded-xl border border-white/10 text-slate-300 hover:bg-white/5 text-sm">Cancel</button>
             <button type="submit" disabled={loading} className="flex-1 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm disabled:opacity-50">
@@ -190,12 +203,15 @@ export default function IncidentsPage() {
   const [showCreate, setShowCreate] = useState(false)
   const [filter, setFilter]         = useState('all')
 
+  const { getAuthHeader } = useAuthStore()
+
   const load = async () => {
     setLoading(true)
     try {
+      const authH = getAuthHeader()
       const [incRes, _] = await Promise.all([
-        fetch('/api/incidents').then(r => r.json()),
-        fetch('/api/incidents/auto-detect', { method: 'POST' }),
+        fetch('/api/incidents', { headers: authH }).then(r => r.json()),
+        fetch('/api/incidents/auto-detect', { method: 'POST', headers: authH }),
       ])
       setIncidents(incRes.incidents || [])
     } finally { setLoading(false) }
@@ -208,7 +224,7 @@ export default function IncidentsPage() {
   const investing = incidents.filter(i => i.status === 'investigating').length
 
   const deleteInc = async (id) => {
-    await fetch(`/api/incidents/${id}`, { method: 'DELETE' })
+    await fetch(`/api/incidents/${id}`, { method: 'DELETE', headers: getAuthHeader() })
     load()
   }
 
