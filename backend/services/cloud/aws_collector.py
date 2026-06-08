@@ -885,19 +885,48 @@ def collect_ssm(session, region: str) -> list:
             for inst in page["InstanceInformationList"]:
                 iid = inst["InstanceId"]
 
-                # Patch compliance
+                # Patch compliance — try describe_instance_patch_states first,
+                # then fall back to SSM compliance summary (populated by RunPatchBaselineAssociation)
                 patch_state = "unknown"
                 missing_patches = failed_patches = installed_patches = 0
                 try:
                     pc = ssm.describe_instance_patch_states(InstanceIds=[iid])
                     if pc["InstancePatchStates"]:
                         ps = pc["InstancePatchStates"][0]
-                        missing_patches  = ps.get("MissingCount",  0)
-                        failed_patches   = ps.get("FailedCount",   0)
-                        installed_patches= ps.get("InstalledCount",0)
+                        missing_patches   = ps.get("MissingCount",   0)
+                        failed_patches    = ps.get("FailedCount",    0)
+                        installed_patches = ps.get("InstalledCount", 0)
                         patch_state = "non_compliant" if missing_patches > 0 or failed_patches > 0 else "compliant"
                 except Exception:
                     pass
+
+                # Fallback: read from SSM Compliance API (written by RunPatchBaselineAssociation)
+                if patch_state == "unknown":
+                    try:
+                        comp = ssm.list_compliance_items(
+                            Filters=[
+                                {"Key": "ComplianceType", "Values": ["Patch"],       "Type": "EQUAL"},
+                                {"Key": "InstanceId",     "Values": [iid],            "Type": "EQUAL"},
+                                {"Key": "Status",         "Values": ["NON_COMPLIANT"],"Type": "EQUAL"},
+                            ],
+                            MaxResults=50,
+                        )
+                        non_compliant_items = comp.get("ComplianceItems", [])
+                        comp2 = ssm.list_compliance_items(
+                            Filters=[
+                                {"Key": "ComplianceType", "Values": ["Patch"],      "Type": "EQUAL"},
+                                {"Key": "InstanceId",     "Values": [iid],           "Type": "EQUAL"},
+                                {"Key": "Status",         "Values": ["COMPLIANT"],  "Type": "EQUAL"},
+                            ],
+                            MaxResults=1,
+                        )
+                        compliant_items = comp2.get("ComplianceItems", [])
+                        if non_compliant_items or compliant_items:
+                            missing_patches   = len(non_compliant_items)
+                            installed_patches = len(compliant_items)
+                            patch_state = "non_compliant" if non_compliant_items else "compliant"
+                    except Exception:
+                        pass
 
                 # Software inventory
                 software = []

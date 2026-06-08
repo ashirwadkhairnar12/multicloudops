@@ -392,13 +392,31 @@ async def run_patch_scan(account_id: str, db: AsyncSession = Depends(get_db)):
                     # Send in batches of 50 (AWS limit)
                     for i in range(0, len(instance_ids), 50):
                         batch = instance_ids[i:i+50]
-                        resp = ssm_client.send_command(
-                            InstanceIds=batch,
-                            DocumentName="AWS-RunPatchBaseline",
-                            Parameters={"Operation": ["Scan"]},
-                            Comment="Patch scan by MultiCloudOps",
-                            TimeoutSeconds=600,
-                        )
+                        # Use AWS-RunPatchBaselineAssociation which handles apt exit codes correctly
+                        # and properly writes results to Patch Manager (unlike AWS-RunPatchBaseline
+                        # which fails on Ubuntu when packages are available due to apt exit code 1)
+                        try:
+                            resp = ssm_client.send_command(
+                                InstanceIds=batch,
+                                DocumentName="AWS-RunPatchBaselineAssociation",
+                                Parameters={"Operation": ["Scan"]},
+                                Comment="Patch scan by MultiCloudOps",
+                                TimeoutSeconds=600,
+                            )
+                        except ssm_client.exceptions.InvalidDocument:
+                            # Fallback: AWS-RunPatchBaseline with reboot option disabled
+                            resp = ssm_client.send_command(
+                                InstanceIds=batch,
+                                DocumentName="AWS-RunPatchBaseline",
+                                Parameters={
+                                    "Operation":          ["Scan"],
+                                    "RebootOption":       ["NoReboot"],
+                                    "SnapshotId":         [""],
+                                    "InstallOverrideList":[""],
+                                },
+                                Comment="Patch scan by MultiCloudOps",
+                                TimeoutSeconds=600,
+                            )
                         results.append({
                             "region":     region,
                             "command_id": resp["Command"]["CommandId"],
