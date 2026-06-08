@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { Cloud, Plus, RefreshCw, CheckCircle, AlertTriangle, Trash2, Play, ExternalLink,
-         Server, Database, Zap, DollarSign, Shield, ChevronRight, Wifi, WifiOff, X,
+         Server, Database, Zap, DollarSign, Shield, ChevronRight, ChevronDown, Wifi, WifiOff, X,
          TrendingDown, Eye, Clock } from 'lucide-react'
 import { AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis,
          CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
