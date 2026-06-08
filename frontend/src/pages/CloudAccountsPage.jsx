@@ -326,11 +326,13 @@ function AccountCard({ account, onSelect, onDelete, onSync, onTest, onEdit, isSy
 
 // ─── Account Detail Panel ─────────────────────────────────────────────────────
 function AccountDetail({ account, onClose }) {
-  const { loadAccountData, syncAccount, accountData, loading, syncingId } = useCloudStore()
-  const [tab, setTab] = useState('resources')
+  const { loadAccountData, syncAccount, accountData, syncingId } = useCloudStore()
+  const [tab,        setTab]        = useState('resources')
+  const [dataLoading, setDataLoading] = useState(true)
 
   useEffect(() => {
-    loadAccountData(account.id)
+    setDataLoading(true)
+    loadAccountData(account.id).finally(() => setDataLoading(false))
   }, [account.id])
 
   // Read from the per-account cache, not from store root (which doesn't have these fields)
@@ -424,7 +426,7 @@ function AccountDetail({ account, onClose }) {
 
         {/* Tab content */}
         <div className="flex-1 overflow-y-auto p-4">
-          {loading ? (
+          {dataLoading ? (
             <div className="flex items-center justify-center py-16">
               <RefreshCw size={20} className="animate-spin text-slate-400 mr-2" />
               <span className="text-slate-400">Loading account data…</span>
