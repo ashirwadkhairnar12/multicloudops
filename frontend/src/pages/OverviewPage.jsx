@@ -206,7 +206,7 @@ function EmptyState({ setActiveNav }) {
 
 // ── MAIN ──────────────────────────────────────────────────────────────────────
 export default function OverviewPage() {
-  const { servers, alerts, trendData, incidents, getStats, setActiveNav, wsConnected, fetchAll } = useStore()
+  const { servers, alerts, trendData, incidents, getStats, setActiveNav, wsConnected, fetchAll, initialized } = useStore()
   const { accounts, getAllResources, getTotalCosts, getAllSecurity, getAllOptimisations, loadAllAccountData } = useCloudStore()
 
   const [history,  setHistory]  = useState([])
@@ -276,7 +276,13 @@ export default function OverviewPage() {
     setLoading(false)
   }
 
-  if (!hasData) return <EmptyState setActiveNav={setActiveNav} />
+  // Show empty state only after initial load completes — prevents flicker
+  if (initialized && !hasData) return <EmptyState setActiveNav={setActiveNav} />
+  if (!initialized && !hasData) return (
+    <div className="flex items-center justify-center py-24">
+      <div className="w-8 h-8 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
+    </div>
+  )
 
   return (
     <div className="space-y-4 animate-fade-in">

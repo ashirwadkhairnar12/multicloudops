@@ -1,13 +1,12 @@
 import { create } from 'zustand'
 
 const useCloudStore = create((set, get) => ({
-  accounts:        [],
-  selectedAccount: null,
-  // Per-account cache: { [accountId]: { resources, costs, security, ssm, optimisations } }
-  accountData:     {},
-  loading:         false,
-  syncingId:       null,
-  error:           null,
+  accounts:    [],
+  accountData: {},   // { [accountId]: { resources, costs, security, ssm, optimisations } }
+  loading:     false,
+  syncingId:   null,
+  error:       null,
+  lastUpdated: null,
 
   fetchAccounts: async () => {
     set({ loading: true, error: null })
@@ -49,13 +48,31 @@ const useCloudStore = create((set, get) => ({
     return data
   },
 
+  updatePollInterval: async (id, seconds) => {
+    const res = await fetch(`/api/cloud-accounts/${id}/poll-interval`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ poll_interval: seconds }),
+    })
+    if (!res.ok) throw new Error('Failed to update')
+    await get().fetchAccounts()
+    return res.json()
+  },
+
   syncAccount: async (id) => {
     set({ syncingId: id })
     try {
+      // Use force-sync to bypass cache
+      const res  = await fetch(`/api/cloud-accounts/${id}/force-sync`, { method: 'POST' })
+      const data = await res.json()
+      await get().fetchAccounts()
+      await get().loadAccountData(id)
+      return data
+    } catch (e) {
+      // fallback to regular sync
       const res  = await fetch(`/api/cloud-accounts/${id}/sync`, { method: 'POST' })
       const data = await res.json()
       await get().fetchAccounts()
-      // Reload data for this account after sync
       await get().loadAccountData(id)
       return data
     } finally {
@@ -71,48 +88,59 @@ const useCloudStore = create((set, get) => ({
         fetch(`/api/cloud-accounts/${id}/security`).then(r => r.json()),
         fetch(`/api/cloud-accounts/${id}/optimisations`).then(r => r.json()),
       ])
+
+      const sec = secRes || {}
+
       set(state => ({
         accountData: {
           ...state.accountData,
           [id]: {
-            resources:     resRes.resources     || [],
-            costs:         costRes.costs        || {},
-            security:      secRes.findings      || [],
-            ssm:           secRes.ssm           || [],
-            optimisations: optRes.optimisations || [],
-            collected_at:  resRes.collected_at  || null,
+            resources:     resRes.resources        || [],
+            costs:         costRes.costs           || resRes.costs || {},
+            security:      sec.findings            || [],
+            guardduty:     sec.guardduty           || [],
+            iam_unused:    sec.iam_unused_roles     || [],
+            config_nc:     sec.config_non_compliant|| [],
+            cloudtrail:    sec.cloudtrail_events   || [],
+            ssm:           sec.ssm || resRes.ssm   || [],
+            optimisations: optRes.optimisations    || [],
+            collected_at:  resRes.collected_at     || null,
+            errors:        resRes.errors           || [],
           }
-        }
+        },
+        lastUpdated: new Date().toISOString(),
       }))
     } catch (e) {
       console.error('loadAccountData:', e)
     }
   },
 
-  // Load data for ALL active accounts — used by dashboards
   loadAllAccountData: async () => {
     const { accounts, loadAccountData } = get()
     const active = accounts.filter(a => a.status === 'active')
+    if (active.length === 0) return
     await Promise.all(active.map(a => loadAccountData(a.id)))
   },
 
-  // ── Computed aggregates used by dashboards ────────────────────────────────
+  // ── Computed aggregates ───────────────────────────────────────────────────
 
-  // All resources across all synced accounts
   getAllResources: () => {
     const { accountData } = get()
     return Object.values(accountData).flatMap(d => d.resources || [])
   },
 
-  // Total costs across all accounts
   getTotalCosts: () => {
     const { accountData } = get()
     const all = Object.values(accountData)
+    if (all.length === 0) return { total_mtd: 0, forecast: 0, by_service: [], daily: [], anomalies: [], savings_utilisation: null, by_tag: {} }
     return {
-      total_mtd: all.reduce((s, d) => s + (d.costs?.total_mtd || 0), 0),
-      forecast:  all.reduce((s, d) => s + (d.costs?.forecast  || 0), 0),
-      by_service: mergeServiceCosts(all.map(d => d.costs?.by_service || [])),
-      daily:     mergeDaily(all.map(d => d.costs?.daily || [])),
+      total_mtd:          all.reduce((s, d) => s + (d.costs?.total_mtd || 0), 0),
+      forecast:           all.reduce((s, d) => s + (d.costs?.forecast  || 0), 0),
+      by_service:         mergeServiceCosts(all.map(d => d.costs?.by_service || [])),
+      daily:              mergeDaily(all.map(d => d.costs?.daily || [])),
+      anomalies:          all.flatMap(d => d.costs?.anomalies || []),
+      savings_utilisation:all.find(d => d.costs?.savings_utilisation)?.costs?.savings_utilisation || null,
+      by_tag:             Object.assign({}, ...all.map(d => d.costs?.by_tag || {})),
     }
   },
 
@@ -121,22 +149,29 @@ const useCloudStore = create((set, get) => ({
     return Object.values(accountData).flatMap(d => d.security || [])
   },
 
+  getAllGuardDuty: () => {
+    const { accountData } = get()
+    return Object.values(accountData).flatMap(d => d.guardduty || [])
+  },
+
   getAllOptimisations: () => {
     const { accountData } = get()
     return Object.values(accountData).flatMap(d => d.optimisations || [])
   },
 
-  setSelectedAccount: (account) => set({ selectedAccount: account }),
+  getAllSSM: () => {
+    const { accountData } = get()
+    return Object.values(accountData).flatMap(d => d.ssm || [])
+  },
 
-  // Backward compat — single-account detail view
-  get resources()     { return Object.values(this.accountData).flatMap(d => d.resources     || []) },
-  get costs()         { return Object.values(this.accountData)[0]?.costs         || {} },
-  get security()      { return Object.values(this.accountData).flatMap(d => d.security      || []) },
-  get ssm()           { return Object.values(this.accountData).flatMap(d => d.ssm           || []) },
-  get optimisations() { return Object.values(this.accountData).flatMap(d => d.optimisations || []) },
+  getAllCloudTrail: () => {
+    const { accountData } = get()
+    return Object.values(accountData).flatMap(d => d.cloudtrail || [])
+  },
+
+  setSelectedAccount: (account) => set({ selectedAccount: account }),
 }))
 
-// Merge service cost arrays from multiple accounts
 function mergeServiceCosts(arrays) {
   const map = {}
   arrays.flat().forEach(item => {
@@ -148,7 +183,6 @@ function mergeServiceCosts(arrays) {
     .sort((a, b) => b.cost - a.cost)
 }
 
-// Merge daily cost arrays from multiple accounts (sum by date)
 function mergeDaily(arrays) {
   const map = {}
   arrays.flat().forEach(item => {

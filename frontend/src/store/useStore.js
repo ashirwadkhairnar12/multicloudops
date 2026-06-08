@@ -11,44 +11,54 @@ const useStore = create((set, get) => ({
   incidents: [],
   trendData: [],
   loading:   false,
+  initialized: false,  // prevents flicker on first load
 
   fetchServers: async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/servers`)
+      const res  = await fetch(`${API_BASE}/api/servers`)
       const data = await res.json()
-      set({ servers: data.servers || [] })
+      // Only update if we got a valid response — never blank out existing data
+      if (Array.isArray(data.servers)) {
+        set({ servers: data.servers })
+      }
     } catch (e) { console.error('fetchServers:', e) }
   },
 
   fetchAlerts: async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/alerts`)
+      const res  = await fetch(`${API_BASE}/api/alerts`)
       const data = await res.json()
-      set({ alerts: data.alerts || [] })
+      if (Array.isArray(data.alerts)) {
+        set({ alerts: data.alerts })
+      }
     } catch (e) { console.error('fetchAlerts:', e) }
   },
 
   fetchIncidents: async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/incidents`)
+      const res  = await fetch(`${API_BASE}/api/incidents`)
       const data = await res.json()
-      set({ incidents: data.incidents || [] })
+      if (Array.isArray(data.incidents)) {
+        set({ incidents: data.incidents })
+      }
     } catch (e) { console.error('fetchIncidents:', e) }
   },
 
   fetchAll: async () => {
     const { fetchServers, fetchAlerts, fetchIncidents } = get()
     await Promise.all([fetchServers(), fetchAlerts(), fetchIncidents()])
+    set({ initialized: true })
   },
 
+  // ── Agents ────────────────────────────────────────────────────────────────
   agents: [],
   agentsLoading: false,
-  agentsError: null,
+  agentsError:   null,
 
   fetchAgents: async () => {
     set({ agentsLoading: true, agentsError: null })
     try {
-      const res = await fetch(`${API_BASE}/api/agents`)
+      const res  = await fetch(`${API_BASE}/api/agents`)
       const data = await res.json()
       set({ agents: data.agents || [], agentsLoading: false })
     } catch (e) {
@@ -72,30 +82,37 @@ const useStore = create((set, get) => ({
     await get().fetchAgents()
   },
 
+  // ── WebSocket ─────────────────────────────────────────────────────────────
   wsConnected: false,
   setWsConnected: (v) => set({ wsConnected: v }),
 
   applyServerUpdate: (incomingServers) => {
+    if (!Array.isArray(incomingServers) || incomingServers.length === 0) return
     set(state => {
       const active = incomingServers.filter(s => s.status !== 'stopped')
       if (active.length === 0) return { servers: incomingServers }
       const now = new Date()
       const point = {
         time:     `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`,
-        cpu:      Math.round(active.reduce((a, s) => a + s.cpu, 0) / active.length),
-        mem:      Math.round(active.reduce((a, s) => a + s.mem, 0) / active.length),
+        cpu:      Math.round(active.reduce((a, s) => a + (s.cpu||0), 0) / active.length),
+        mem:      Math.round(active.reduce((a, s) => a + (s.mem||0), 0) / active.length),
         critical: incomingServers.filter(s => s.status === 'critical').length,
         warning:  incomingServers.filter(s => s.status === 'warning').length,
       }
-      return { servers: incomingServers, trendData: [...state.trendData.slice(-23), point] }
+      return {
+        servers:   incomingServers,
+        trendData: [...state.trendData.slice(-23), point],
+        initialized: true,
+      }
     })
     get().fetchAlerts()
   },
 
+  // ── Filters ───────────────────────────────────────────────────────────────
   selectedProvider: 'All',
   setSelectedProvider: (p) => set({ selectedProvider: p }),
-  selectedStatus: 'All',
-  setSelectedStatus: (s) => set({ selectedStatus: s }),
+  selectedStatus:   'All',
+  setSelectedStatus:   (s) => set({ selectedStatus: s }),
 
   getFilteredServers: () => {
     const { servers, selectedProvider, selectedStatus } = get()

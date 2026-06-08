@@ -243,7 +243,7 @@ function AddAccountModal({ onClose, onAdded }) {
 }
 
 // ─── Account Card ─────────────────────────────────────────────────────────────
-function AccountCard({ account, onSelect, onDelete, onSync, onTest, isSyncing }) {
+function AccountCard({ account, onSelect, onDelete, onSync, onTest, onEdit, isSyncing }) {
   const meta   = PROVIDER_META[account.provider] || PROVIDER_META.AWS
   const status = STATUS_META[account.status]     || STATUS_META.pending
 
@@ -310,6 +310,10 @@ function AccountCard({ account, onSelect, onDelete, onSync, onTest, isSyncing })
             {isSyncing ? <RefreshCw size={11} className="animate-spin" /> : <Play size={11} />}
             Sync
           </button>
+          <button onClick={() => onEdit(account)}
+            className="p-1.5 rounded-lg hover:bg-blue-500/10 text-slate-500 hover:text-blue-400 transition-colors border border-white/10">
+            <ChevronDown size={13} />
+          </button>
           <button onClick={() => onDelete(account.id)}
             className="p-1.5 rounded-lg hover:bg-red-500/10 text-slate-500 hover:text-red-400 transition-colors border border-white/10">
             <Trash2 size={13} />
@@ -325,7 +329,9 @@ function AccountDetail({ account, onClose }) {
   const { loadAccountData, syncAccount, resources, costs, security, ssm, optimisations, loading, syncingId } = useCloudStore()
   const [tab, setTab] = useState('resources')
 
-  useEffect(() => { loadAccountData(account.id) }, [account.id])
+  useEffect(() => {
+    loadAccountData(account.id)
+  }, [account.id])
 
   const byService = resources.reduce((acc, r) => {
     acc[r.service] = (acc[r.service] || [])
@@ -749,11 +755,79 @@ function SSMTab({ items }) {
   )
 }
 
+
+// ─── Edit Account Modal ───────────────────────────────────────────────────────
+function EditAccountModal({ account, onClose, onSaved }) {
+  const { updatePollInterval } = useCloudStore()
+  const [interval, setInterval] = useState(account.poll_interval || 300)
+  const [loading,  setLoading]  = useState(false)
+  const [saved,    setSaved]    = useState(false)
+
+  const save = async () => {
+    setLoading(true)
+    try {
+      await updatePollInterval(account.id, interval)
+      setSaved(true)
+      setTimeout(() => { setSaved(false); onSaved(); onClose() }, 1200)
+    } finally { setLoading(false) }
+  }
+
+  const label = interval < 60    ? 'Too short'
+              : interval < 300   ? `${interval}s (frequent — higher CloudWatch cost)`
+              : interval === 300 ? '5 min (recommended)'
+              : interval < 900   ? `${interval}s`
+              : interval < 3600  ? `${Math.round(interval/60)} min`
+              : '1 hour'
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+      <div className="bg-bg-secondary border border-white/10 rounded-2xl w-full max-w-sm shadow-2xl p-6 space-y-5">
+        <div className="flex items-center justify-between">
+          <h2 className="font-semibold text-white">Edit Sync Settings</h2>
+          <button onClick={onClose} className="text-slate-400 hover:text-white text-xl">×</button>
+        </div>
+        <div>
+          <p className="text-sm font-medium text-white mb-1">{account.name}</p>
+          <p className="text-xs text-slate-500">Account ID: {account.account_id}</p>
+        </div>
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <label className="text-xs text-slate-400">Poll Interval</label>
+            <span className={`text-xs font-mono font-medium ${interval < 300 ? 'text-yellow-400' : 'text-orange-400'}`}>
+              {label}
+            </span>
+          </div>
+          <input type="range" min={60} max={3600} step={60}
+            value={interval} onChange={e => setInterval(parseInt(e.target.value))}
+            className="w-full accent-orange-500" />
+          <div className="flex justify-between text-[10px] text-slate-600 mt-1">
+            <span>1 min</span><span>5 min</span><span>30 min</span><span>1 hour</span>
+          </div>
+        </div>
+        <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-3 text-[11px] text-yellow-400">
+          ⚠ Shorter intervals = more CloudWatch API calls = higher AWS cost.
+          5 min is the recommended balance.
+        </div>
+        <div className="flex gap-3">
+          <button onClick={onClose} className="flex-1 py-2.5 rounded-xl border border-white/10 text-slate-300 hover:bg-white/5 text-sm">Cancel</button>
+          <button onClick={save} disabled={loading}
+            className={`flex-1 py-2.5 rounded-xl text-white text-sm font-medium transition-colors disabled:opacity-50 ${
+              saved ? 'bg-green-600' : 'bg-orange-600 hover:bg-orange-500'
+            }`}>
+            {loading ? 'Saving…' : saved ? '✓ Saved' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ─── Main Page ────────────────────────────────────────────────────────────────
 export default function CloudAccountsPage() {
   const { accounts, loading, syncingId, fetchAccounts, deleteAccount, testConnection, syncAccount } = useCloudStore()
-  const [showAdd,  setShowAdd]  = useState(false)
-  const [selected, setSelected] = useState(null)
+  const [showAdd,   setShowAdd]   = useState(false)
+  const [selected,  setSelected]  = useState(null)
+  const [editAccount, setEditAccount] = useState(null)
 
   useEffect(() => { fetchAccounts() }, [])
 
@@ -838,6 +912,7 @@ export default function CloudAccountsPage() {
               onDelete={deleteAccount}
               onSync={syncAccount}
               onTest={testConnection}
+              onEdit={setEditAccount}
               isSyncing={syncingId === account.id}
             />
           ))}
@@ -845,8 +920,9 @@ export default function CloudAccountsPage() {
       )}
 
       {/* Modals */}
-      {showAdd  && <AddAccountModal onClose={() => setShowAdd(false)} onAdded={fetchAccounts} />}
-      {selected && <AccountDetail account={selected} onClose={() => setSelected(null)} />}
+      {showAdd     && <AddAccountModal onClose={() => setShowAdd(false)} onAdded={fetchAccounts} />}
+      {selected    && <AccountDetail account={selected} onClose={() => setSelected(null)} />}
+      {editAccount && <EditAccountModal account={editAccount} onClose={() => setEditAccount(null)} onSaved={fetchAccounts} />}
     </div>
   )
 }

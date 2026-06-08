@@ -204,17 +204,19 @@ async def get_account_resources(account_id: str, db: AsyncSession = Depends(get_
         raise HTTPException(status_code=404, detail="Account not found")
 
     from services.cloud.poller import _cache
-    cached = _cache.get(account.account_id or account.id)
+    # Try both the AWS account ID and the internal account ID as cache keys
+    cached = _cache.get(account.account_id) or _cache.get(account.id)
     if not cached:
-        return {"resources": [], "message": "No data yet — trigger a sync first"}
+        return {"resources": [], "message": "No data yet — trigger a sync first",
+                "costs": {}, "ssm": [], "security": {}, "optimisations": []}
 
     data = cached["data"]
     return {
-        "account_id":    data.get("account_id"),
+        "account_id":    data.get("account_id", account.account_id),
         "resources":     data.get("resources", []),
         "costs":         data.get("costs", {}),
         "ssm":           data.get("ssm", []),
-        "security":      data.get("security", []),
+        "security":      data.get("security", {}),
         "optimisations": data.get("optimisations", []),
         "collected_at":  data.get("collected_at"),
         "errors":        data.get("errors", []),
@@ -230,10 +232,11 @@ async def get_account_costs(account_id: str, db: AsyncSession = Depends(get_db))
         raise HTTPException(status_code=404, detail="Account not found")
 
     from services.cloud.poller import _cache
-    cached = _cache.get(account.account_id or account.id)
+    cached = _cache.get(account.account_id) or _cache.get(account.id)
     if not cached:
         return {"costs": {}, "message": "No data yet"}
-    return {"costs": cached["data"].get("costs", {}), "collected_at": cached.get("fetched_at", "").isoformat() if cached.get("fetched_at") else ""}
+    return {"costs": cached["data"].get("costs", {}),
+            "collected_at": cached.get("fetched_at", "").isoformat() if cached.get("fetched_at") else ""}
 
 
 @router.get("/{account_id}/security")
@@ -244,7 +247,7 @@ async def get_account_security(account_id: str, db: AsyncSession = Depends(get_d
         raise HTTPException(status_code=404, detail="Account not found")
 
     from services.cloud.poller import _cache
-    cached = _cache.get(account.account_id or account.id)
+    cached = _cache.get(account.account_id) or _cache.get(account.id)
     if not cached:
         return {"findings": [], "guardduty": [], "iam_unused_roles": [],
                 "config_non_compliant": [], "cloudtrail_events": [],
@@ -280,7 +283,70 @@ async def get_optimisations(account_id: str, db: AsyncSession = Depends(get_db))
         raise HTTPException(status_code=404, detail="Account not found")
 
     from services.cloud.poller import _cache
-    cached = _cache.get(account.account_id or account.id)
+    cached = _cache.get(account.account_id) or _cache.get(account.id)
     if not cached:
         return {"optimisations": [], "message": "No data yet"}
     return {"optimisations": cached["data"].get("optimisations", [])}
+
+@router.patch("/{account_id}/poll-interval")
+async def update_poll_interval(
+    account_id: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update poll interval (seconds). Min 60s, Max 3600s."""
+    result = await db.execute(select(CloudAccount).where(CloudAccount.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    interval = int(payload.get("poll_interval", 300))
+    interval = max(60, min(3600, interval))
+    account.poll_interval = interval
+    await db.commit()
+    return {"poll_interval": interval, "message": f"Poll interval updated to {interval}s"}
+
+
+@router.post("/{account_id}/force-sync")
+async def force_sync(account_id: str, db: AsyncSession = Depends(get_db)):
+    """Force immediate sync regardless of poll interval."""
+    result = await db.execute(select(CloudAccount).where(CloudAccount.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if account.status != "active":
+        raise HTTPException(status_code=400, detail="Account not active")
+
+    # Reset last_sync to force re-poll
+    account.last_sync = None
+    await db.commit()
+
+    # Trigger immediate poll
+    from services.cloud.poller import poll_account, _cache
+    acc_dict = {
+        "id": account.id, "name": account.name, "provider": account.provider,
+        "account_id": account.account_id, "regions": account.regions,
+        "access_key": account.access_key, "secret_key": account.secret_key,
+        "role_arn": account.role_arn, "poll_interval": account.poll_interval,
+        "status": account.status,
+    }
+    # Bypass cache by clearing it first
+    _cache.pop(account.account_id, None)
+    _cache.pop(account.id, None)
+
+    data = await poll_account(acc_dict)
+
+    from db.database import AsyncSessionLocal as _ASL
+    from datetime import datetime, timezone
+    async with _ASL() as db2:
+        result2 = await db2.execute(select(CloudAccount).where(CloudAccount.id == account_id))
+        acc2 = result2.scalar_one_or_none()
+        if acc2:
+            acc2.last_sync = datetime.now(timezone.utc).replace(tzinfo=None)
+            acc2.error_msg = "; ".join(data.get("errors", [])[:3]) if data.get("errors") else ""
+            await db2.commit()
+
+    return {
+        "message":        "Force sync complete",
+        "resources_found": len(data.get("resources", [])),
+        "errors":          data.get("errors", []),
+    }
