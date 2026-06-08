@@ -370,7 +370,7 @@ async def run_patch_scan(account_id: str, db: AsyncSession = Depends(get_db)):
         errors  = []
         try:
             from services.cloud.aws_collector import _boto_session
-            import json
+            import json, botocore.exceptions
             regions = json.loads(account.regions) if account.regions else ["us-east-1"]
             session = _boto_session({
                 "access_key": account.access_key,
@@ -380,48 +380,54 @@ async def run_patch_scan(account_id: str, db: AsyncSession = Depends(get_db)):
             for region in regions:
                 try:
                     ssm_client = session.client("ssm", region_name=region)
-                    pages = ssm_client.get_paginator("describe_instance_information").paginate()
-                    instance_ids = [
-                        inst["InstanceId"]
-                        for page in pages
-                        for inst in page["InstanceInformationList"]
-                        if inst.get("PingStatus") == "Online"
-                    ]
+
+                    # Fetch all managed instances (not just Online) and filter
+                    instance_ids = []
+                    next_token = None
+                    while True:
+                        kwargs = {"MaxResults": 50}
+                        if next_token:
+                            kwargs["NextToken"] = next_token
+                        resp = ssm_client.describe_instance_information(**kwargs)
+                        for inst in resp.get("InstanceInformationList", []):
+                            # Accept Online and any non-empty ping status
+                            ping = inst.get("PingStatus", "")
+                            if ping in ("Online", "ConnectionLost"):
+                                instance_ids.append(inst["InstanceId"])
+                        next_token = resp.get("NextToken")
+                        if not next_token:
+                            break
+
                     if not instance_ids:
+                        errors.append(f"{region}: No managed instances found (check IAM permissions or SSM Agent status)")
                         continue
-                    # Send in batches of 50 (AWS limit)
+
+                    # Send scan command in batches of 50 (AWS hard limit)
                     for i in range(0, len(instance_ids), 50):
                         batch = instance_ids[i:i+50]
-                        # Use AWS-RunPatchBaselineAssociation which handles apt exit codes correctly
-                        # and properly writes results to Patch Manager (unlike AWS-RunPatchBaseline
-                        # which fails on Ubuntu when packages are available due to apt exit code 1)
+                        cmd_resp = None
+
+                        # Try AWS-RunPatchBaseline with only valid Scan parameters
                         try:
-                            resp = ssm_client.send_command(
+                            cmd_resp = ssm_client.send_command(
                                 InstanceIds=batch,
-                                DocumentName="AWS-RunPatchBaselineAssociation",
+                                DocumentName="AWS-RunPatchBaseline",
                                 Parameters={"Operation": ["Scan"]},
                                 Comment="Patch scan by MultiCloudOps",
                                 TimeoutSeconds=600,
                             )
-                        except ssm_client.exceptions.InvalidDocument:
-                            # Fallback: AWS-RunPatchBaseline with reboot option disabled
-                            resp = ssm_client.send_command(
-                                InstanceIds=batch,
-                                DocumentName="AWS-RunPatchBaseline",
-                                Parameters={
-                                    "Operation":          ["Scan"],
-                                    "RebootOption":       ["NoReboot"],
-                                    "SnapshotId":         [""],
-                                    "InstallOverrideList":[""],
-                                },
-                                Comment="Patch scan by MultiCloudOps",
-                                TimeoutSeconds=600,
-                            )
-                        results.append({
-                            "region":     region,
-                            "command_id": resp["Command"]["CommandId"],
-                            "instances":  len(batch),
-                        })
+                        except botocore.exceptions.ClientError as e:
+                            errors.append(f"{region}: {e.response['Error']['Message']}")
+                            continue
+
+                        if cmd_resp:
+                            results.append({
+                                "region":     region,
+                                "command_id": cmd_resp["Command"]["CommandId"],
+                                "instances":  len(batch),
+                            })
+                except botocore.exceptions.ClientError as e:
+                    errors.append(f"{region}: {e.response['Error']['Message']}")
                 except Exception as e:
                     errors.append(f"{region}: {str(e)}")
         except Exception as e:
