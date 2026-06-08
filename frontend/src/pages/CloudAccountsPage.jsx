@@ -440,7 +440,7 @@ function AccountDetail({ account, onClose }) {
           ) : tab === 'optimisations' ? (
             <OptimisationsTab items={optimisations} />
           ) : tab === 'ssm' ? (
-            <SSMTab items={ssm} />
+            <SSMTab items={ssm} accountId={account.id} />
           ) : null}
         </div>
       </div>
@@ -726,41 +726,274 @@ function OptimisationsTab({ items }) {
 }
 
 // ─── SSM Tab ──────────────────────────────────────────────────────────────────
-function SSMTab({ items }) {
+function SSMTab({ items, accountId }) {
+  const [scanning,    setScanning]    = useState(false)
+  const [scanResult,  setScanResult]  = useState(null)
+  const [scanError,   setScanError]   = useState(null)
+  const [expanded,    setExpanded]    = useState(null)
+  const [cmdStatus,   setCmdStatus]   = useState({}) // commandId -> status obj
+
+  const runPatchScan = async () => {
+    setScanning(true)
+    setScanResult(null)
+    setScanError(null)
+    try {
+      const res  = await fetch(`/api/cloud-accounts/${accountId}/ssm/run-patch-scan`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `Error ${res.status}`)
+      setScanResult(data)
+      // Start polling command status
+      for (const cmd of (data.commands || [])) {
+        pollCommandStatus(accountId, cmd.command_id)
+      }
+    } catch (e) {
+      setScanError(e.message)
+    } finally {
+      setScanning(false)
+    }
+  }
+
+  const pollCommandStatus = async (acctId, commandId, attempts = 0) => {
+    if (attempts > 12) return // stop after ~2 minutes
+    try {
+      const res  = await fetch(`/api/cloud-accounts/${acctId}/ssm/command-status/${commandId}`)
+      const data = await res.json()
+      setCmdStatus(prev => ({ ...prev, [commandId]: data }))
+      const statuses = data.statuses || {}
+      const pending  = (statuses['Pending'] || 0) + (statuses['InProgress'] || 0)
+      if (pending > 0) {
+        setTimeout(() => pollCommandStatus(acctId, commandId, attempts + 1), 10000)
+      }
+    } catch (e) {
+      console.error('pollCommandStatus:', e)
+    }
+  }
+
   if (!items.length) {
     return (
       <div className="flex flex-col items-center py-16 text-center">
         <Server size={32} className="text-slate-600 mb-3" />
-        <p className="text-white font-medium">No SSM data</p>
-        <p className="text-slate-400 text-sm mt-1">Ensure SSM Agent is installed and IAM role has ssm:DescribeInstanceInformation</p>
+        <p className="text-white font-medium">No SSM-managed instances</p>
+        <p className="text-slate-400 text-sm mt-1 max-w-sm">
+          Ensure SSM Agent is installed and the IAM role has <code className="text-slate-300">ssm:DescribeInstanceInformation</code> permission.
+        </p>
       </div>
     )
   }
+
+  const compliant    = items.filter(i => i.patch_state === 'compliant').length
+  const nonCompliant = items.filter(i => i.patch_state === 'non_compliant').length
+  const unknown      = items.filter(i => !i.patch_state || i.patch_state === 'unknown').length
+  const online       = items.filter(i => i.ping_status === 'Online').length
+  const totalPatches = items.reduce((s, i) => s + (i.installed_patches || 0), 0)
+  const totalMissing = items.reduce((s, i) => s + (i.missing_patches  || 0), 0)
+  const totalFailed  = items.reduce((s, i) => s + (i.failed_patches   || 0), 0)
+
   return (
-    <div className="space-y-2">
-      {items.map(inst => (
-        <div key={inst.instance_id} className="bg-bg-primary border border-white/10 rounded-xl p-4 flex items-center gap-4">
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-mono text-white">{inst.instance_id}</p>
-            <p className="text-xs text-slate-500 mt-0.5">{inst.platform} {inst.platform_version}</p>
+    <div className="space-y-4">
+
+      {/* ── Summary bar ── */}
+      <div className="grid grid-cols-5 gap-2">
+        {[
+          { label: 'Online',      value: online,       color: 'text-green-400'  },
+          { label: 'Compliant',   value: compliant,    color: 'text-green-400'  },
+          { label: 'Non-Compliant', value: nonCompliant, color: 'text-red-400'  },
+          { label: 'Unknown',     value: unknown,      color: 'text-yellow-400' },
+          { label: 'Missing Patches', value: totalMissing, color: totalMissing > 0 ? 'text-red-400' : 'text-slate-300' },
+        ].map(({ label, value, color }) => (
+          <div key={label} className="bg-bg-primary border border-white/10 rounded-xl p-3 text-center">
+            <p className={`text-xl font-bold ${color}`}>{value}</p>
+            <p className="text-[10px] text-slate-500 mt-0.5">{label}</p>
           </div>
-          <div className="text-right">
-            <p className="text-[10px] text-slate-500">Ping</p>
-            <p className={`text-xs font-medium ${inst.ping_status==='Online'?'text-green-400':'text-red-400'}`}>{inst.ping_status}</p>
-          </div>
-          <div className="text-right">
-            <p className="text-[10px] text-slate-500">Patches</p>
-            <p className={`text-xs font-medium ${inst.patch_state==='compliant'?'text-green-400':'text-yellow-400'}`}>
-              {inst.patch_state === 'compliant' ? 'Compliant' : `${inst.missing_patches} missing`}
-            </p>
-          </div>
-          <span className={`text-[10px] px-2 py-0.5 rounded-lg border ${
-            inst.patch_state==='compliant'
-              ? 'border-green-500/30 text-green-400 bg-green-500/10'
-              : 'border-yellow-500/30 text-yellow-400 bg-yellow-500/10'
-          }`}>{inst.patch_state || 'unknown'}</span>
+        ))}
+      </div>
+
+      {/* ── Run Patch Scan button ── */}
+      <div className="flex items-center justify-between">
+        <p className="text-xs text-slate-500">{items.length} managed instance{items.length !== 1 ? 's' : ''}</p>
+        <button
+          onClick={runPatchScan}
+          disabled={scanning}
+          className="flex items-center gap-2 px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/30 border border-blue-500/30 rounded-lg text-xs text-blue-400 disabled:opacity-50 transition-colors"
+        >
+          <RefreshCw size={12} className={scanning ? 'animate-spin' : ''} />
+          {scanning ? 'Triggering scan…' : 'Run Patch Scan'}
+        </button>
+      </div>
+
+      {/* ── Scan result feedback ── */}
+      {scanResult && (
+        <div className="bg-green-500/10 border border-green-500/20 rounded-xl p-3 text-xs text-green-400">
+          ✓ {scanResult.message}
+          {scanResult.commands?.map(cmd => {
+            const st = cmdStatus[cmd.command_id]
+            return (
+              <span key={cmd.command_id} className="ml-2 text-slate-400">
+                [{cmd.region} · {st ? Object.entries(st.statuses || {}).map(([k,v]) => `${v} ${k}`).join(', ') || 'Pending…' : 'Pending…'}]
+              </span>
+            )
+          })}
+          {scanResult.errors?.length > 0 && (
+            <p className="text-yellow-400 mt-1">⚠ {scanResult.errors.join(', ')}</p>
+          )}
         </div>
-      ))}
+      )}
+      {scanError && (
+        <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-3 text-xs text-red-400">
+          ✗ {scanError}
+        </div>
+      )}
+
+      {/* ── Instance rows ── */}
+      <div className="space-y-2">
+        {items.map(inst => {
+          const isExpanded = expanded === inst.instance_id
+          const patchColor = inst.patch_state === 'compliant'
+            ? 'border-green-500/30 text-green-400 bg-green-500/10'
+            : inst.patch_state === 'non_compliant'
+              ? 'border-red-500/30 text-red-400 bg-red-500/10'
+              : 'border-yellow-500/30 text-yellow-400 bg-yellow-500/10'
+
+          return (
+            <div key={inst.instance_id} className="bg-bg-primary border border-white/10 rounded-xl overflow-hidden">
+              {/* ── Row header ── */}
+              <div
+                className="flex items-center gap-4 p-4 cursor-pointer hover:bg-white/5 transition-colors"
+                onClick={() => setExpanded(isExpanded ? null : inst.instance_id)}
+              >
+                {/* Instance info */}
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-mono text-white">{inst.instance_id}</p>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <p className="text-xs text-slate-500">{inst.platform} {inst.platform_version}</p>
+                    {inst.region && (
+                      <span className="text-[10px] text-slate-600 bg-white/5 px-1.5 py-0.5 rounded">{inst.region}</span>
+                    )}
+                  </div>
+                </div>
+
+                {/* SSM Agent version */}
+                {inst.agent_version && (
+                  <div className="text-right hidden sm:block">
+                    <p className="text-[10px] text-slate-500">SSM Agent</p>
+                    <p className="text-xs text-slate-300 font-mono">{inst.agent_version}</p>
+                  </div>
+                )}
+
+                {/* Ping status */}
+                <div className="text-right">
+                  <p className="text-[10px] text-slate-500">Ping</p>
+                  <p className={`text-xs font-semibold ${inst.ping_status === 'Online' ? 'text-green-400' : 'text-red-400'}`}>
+                    {inst.ping_status || '—'}
+                  </p>
+                </div>
+
+                {/* Patches installed */}
+                <div className="text-right">
+                  <p className="text-[10px] text-slate-500">Installed</p>
+                  <p className="text-xs text-slate-300 font-semibold">{inst.installed_patches ?? '—'}</p>
+                </div>
+
+                {/* Missing patches */}
+                <div className="text-right">
+                  <p className="text-[10px] text-slate-500">Missing</p>
+                  <p className={`text-xs font-semibold ${(inst.missing_patches || 0) > 0 ? 'text-red-400' : 'text-slate-300'}`}>
+                    {inst.missing_patches ?? '—'}
+                  </p>
+                </div>
+
+                {/* Failed patches */}
+                <div className="text-right">
+                  <p className="text-[10px] text-slate-500">Failed</p>
+                  <p className={`text-xs font-semibold ${(inst.failed_patches || 0) > 0 ? 'text-red-400' : 'text-slate-300'}`}>
+                    {inst.failed_patches ?? '—'}
+                  </p>
+                </div>
+
+                {/* Patch state badge */}
+                <span className={`text-[10px] px-2 py-0.5 rounded-lg border shrink-0 ${patchColor}`}>
+                  {inst.patch_state === 'compliant'     ? 'Compliant'
+                   : inst.patch_state === 'non_compliant' ? 'Non-Compliant'
+                   : 'Unknown'}
+                </span>
+
+                <ChevronDown size={14} className={`text-slate-500 transition-transform shrink-0 ${isExpanded ? 'rotate-180' : ''}`} />
+              </div>
+
+              {/* ── Expanded detail ── */}
+              {isExpanded && (
+                <div className="border-t border-white/10 p-4 space-y-4">
+
+                  {/* Last ping time */}
+                  {inst.last_ping && (
+                    <div className="flex items-center gap-2 text-xs text-slate-400">
+                      <Clock size={12} />
+                      Last ping: {new Date(inst.last_ping).toLocaleString()}
+                    </div>
+                  )}
+
+                  {/* Patch breakdown */}
+                  {inst.patch_state !== 'unknown' && (
+                    <div>
+                      <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-2">Patch Summary</p>
+                      <div className="grid grid-cols-3 gap-2">
+                        {[
+                          { label: 'Installed', value: inst.installed_patches, color: 'text-green-400'  },
+                          { label: 'Missing',   value: inst.missing_patches,   color: (inst.missing_patches||0) > 0 ? 'text-red-400' : 'text-slate-300' },
+                          { label: 'Failed',    value: inst.failed_patches,    color: (inst.failed_patches||0)  > 0 ? 'text-red-400' : 'text-slate-300' },
+                        ].map(({ label, value, color }) => (
+                          <div key={label} className="bg-white/5 rounded-lg p-2 text-center">
+                            <p className={`text-lg font-bold ${color}`}>{value ?? 0}</p>
+                            <p className="text-[10px] text-slate-500">{label}</p>
+                          </div>
+                        ))}
+                      </div>
+                      {inst.patch_state === 'unknown' && (
+                        <p className="text-xs text-yellow-400 mt-2">
+                          ⚠ Patch data unavailable — click "Run Patch Scan" above to trigger a baseline scan.
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  {inst.patch_state === 'unknown' && (
+                    <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-3 text-xs text-yellow-400">
+                      ⚠ Patch state unknown — AWS Patch Manager hasn't run a scan on this instance yet.
+                      Use <strong>Run Patch Scan</strong> above to trigger <code>AWS-RunPatchBaseline</code>.
+                    </div>
+                  )}
+
+                  {/* Software inventory */}
+                  {inst.software && inst.software.length > 0 && (
+                    <div>
+                      <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-2">
+                        Software ({inst.software_count || inst.software.length} packages{inst.software_count > inst.software.length ? `, showing ${inst.software.length}` : ''})
+                      </p>
+                      <div className="max-h-36 overflow-y-auto space-y-1 pr-1">
+                        {inst.software.map((sw, idx) => (
+                          <div key={idx} className="flex justify-between items-center text-xs py-1 border-b border-white/5">
+                            <span className="text-slate-300 truncate flex-1">{sw.name}</span>
+                            <span className="text-slate-500 font-mono ml-3 shrink-0">{sw.version}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {/* ── Footer totals ── */}
+      {(totalPatches > 0 || totalMissing > 0) && (
+        <div className="flex justify-end gap-4 text-xs text-slate-500 pt-1 border-t border-white/5">
+          <span>Total installed: <strong className="text-slate-300">{totalPatches}</strong></span>
+          {totalMissing > 0 && <span className="text-red-400">Total missing: <strong>{totalMissing}</strong></span>}
+          {totalFailed  > 0 && <span className="text-red-400">Total failed: <strong>{totalFailed}</strong></span>}
+        </div>
+      )}
     </div>
   )
 }

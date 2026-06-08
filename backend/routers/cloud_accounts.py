@@ -350,3 +350,111 @@ async def force_sync(account_id: str, db: AsyncSession = Depends(get_db)):
         "resources_found": len(data.get("resources", [])),
         "errors":          data.get("errors", []),
     }
+
+
+@router.post("/{account_id}/ssm/run-patch-scan")
+async def run_patch_scan(account_id: str, db: AsyncSession = Depends(get_db)):
+    """Trigger AWS-RunPatchBaseline Scan on all Online SSM instances for this account."""
+    result = await db.execute(select(CloudAccount).where(CloudAccount.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if account.status != "active":
+        raise HTTPException(status_code=400, detail="Account not active")
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    def _run():
+        results = []
+        errors  = []
+        try:
+            from services.cloud.aws_collector import _boto_session
+            import json
+            regions = json.loads(account.regions) if account.regions else ["us-east-1"]
+            session = _boto_session({
+                "access_key": account.access_key,
+                "secret_key": account.secret_key,
+                "role_arn":   account.role_arn,
+            })
+            for region in regions:
+                try:
+                    ssm_client = session.client("ssm", region_name=region)
+                    pages = ssm_client.get_paginator("describe_instance_information").paginate()
+                    instance_ids = [
+                        inst["InstanceId"]
+                        for page in pages
+                        for inst in page["InstanceInformationList"]
+                        if inst.get("PingStatus") == "Online"
+                    ]
+                    if not instance_ids:
+                        continue
+                    # Send in batches of 50 (AWS limit)
+                    for i in range(0, len(instance_ids), 50):
+                        batch = instance_ids[i:i+50]
+                        resp = ssm_client.send_command(
+                            InstanceIds=batch,
+                            DocumentName="AWS-RunPatchBaseline",
+                            Parameters={"Operation": ["Scan"]},
+                            Comment="Patch scan by MultiCloudOps",
+                            TimeoutSeconds=600,
+                        )
+                        results.append({
+                            "region":     region,
+                            "command_id": resp["Command"]["CommandId"],
+                            "instances":  len(batch),
+                        })
+                except Exception as e:
+                    errors.append(f"{region}: {str(e)}")
+        except Exception as e:
+            errors.append(str(e))
+        return {"results": results, "errors": errors}
+
+    data = await loop.run_in_executor(None, _run)
+    total_instances = sum(r["instances"] for r in data["results"])
+    return {
+        "message":  f"Patch scan triggered on {total_instances} instance(s)" if total_instances else "No online instances found",
+        "commands": data["results"],
+        "errors":   data["errors"],
+    }
+
+
+@router.get("/{account_id}/ssm/command-status/{command_id}")
+async def get_command_status(account_id: str, command_id: str, db: AsyncSession = Depends(get_db)):
+    """Poll the status of an SSM send_command invocation."""
+    result = await db.execute(select(CloudAccount).where(CloudAccount.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    def _check():
+        try:
+            from services.cloud.aws_collector import _boto_session
+            import json
+            regions = json.loads(account.regions) if account.regions else ["us-east-1"]
+            session = _boto_session({
+                "access_key": account.access_key,
+                "secret_key": account.secret_key,
+                "role_arn":   account.role_arn,
+            })
+            for region in regions:
+                try:
+                    ssm_client = session.client("ssm", region_name=region)
+                    resp = ssm_client.list_command_invocations(CommandId=command_id, Details=False)
+                    invocations = resp.get("CommandInvocations", [])
+                    statuses: dict = {}
+                    for inv in invocations:
+                        s = inv.get("Status", "Unknown")
+                        statuses[s] = statuses.get(s, 0) + 1
+                    if invocations:
+                        return {"command_id": command_id, "region": region, "statuses": statuses, "total": len(invocations)}
+                except Exception:
+                    continue
+        except Exception as e:
+            return {"error": str(e)}
+        return {"command_id": command_id, "statuses": {}, "total": 0}
+
+    return await loop.run_in_executor(None, _check)
