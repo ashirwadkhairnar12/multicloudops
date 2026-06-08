@@ -326,12 +326,20 @@ function AccountCard({ account, onSelect, onDelete, onSync, onTest, onEdit, isSy
 
 // ─── Account Detail Panel ─────────────────────────────────────────────────────
 function AccountDetail({ account, onClose }) {
-  const { loadAccountData, syncAccount, resources, costs, security, ssm, optimisations, loading, syncingId } = useCloudStore()
+  const { loadAccountData, syncAccount, accountData, loading, syncingId } = useCloudStore()
   const [tab, setTab] = useState('resources')
 
   useEffect(() => {
     loadAccountData(account.id)
   }, [account.id])
+
+  // Read from the per-account cache, not from store root (which doesn't have these fields)
+  const data         = accountData[account.id] || {}
+  const resources    = data.resources     || []
+  const costs        = data.costs         || {}
+  const security     = data.security      || []
+  const ssm          = data.ssm           || []
+  const optimisations= data.optimisations || []
 
   const byService = resources.reduce((acc, r) => {
     acc[r.service] = (acc[r.service] || [])
@@ -824,7 +832,7 @@ function EditAccountModal({ account, onClose, onSaved }) {
 
 // ─── Main Page ────────────────────────────────────────────────────────────────
 export default function CloudAccountsPage() {
-  const { accounts, loading, syncingId, error, fetchAccounts, deleteAccount, testConnection, syncAccount } = useCloudStore()
+  const { accounts, loading, syncingId, fetchAccounts, deleteAccount, testConnection, syncAccount } = useCloudStore()
   const [showAdd,   setShowAdd]   = useState(false)
   const [selected,  setSelected]  = useState(null)
   const [editAccount, setEditAccount] = useState(null)
@@ -872,17 +880,8 @@ export default function CloudAccountsPage() {
         ))}
       </div>
 
-      {/* Error banner */}
-      {error && (
-        <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 flex items-center gap-3 text-sm text-red-300">
-          <AlertTriangle size={16} className="shrink-0 text-red-400" />
-          <span>{error}</span>
-          <button onClick={fetchAccounts} className="ml-auto text-xs text-red-400 hover:text-red-300 underline">Retry</button>
-        </div>
-      )}
-
       {/* How it works */}
-      {!error && accounts.length === 0 && (
+      {accounts.length === 0 && (
         <div className="bg-orange-500/5 border border-orange-500/20 rounded-2xl p-5">
           <h3 className="text-sm font-semibold text-orange-300 mb-3 flex items-center gap-2">
             <Cloud size={14} /> How Cloud Account Integration Works

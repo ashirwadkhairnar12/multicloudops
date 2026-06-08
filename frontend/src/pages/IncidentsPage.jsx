@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { Activity, Plus, RefreshCw, CheckCircle, Clock, AlertTriangle, XCircle, User, Trash2, ChevronDown } from 'lucide-react'
 import useStore from '@/store/useStore'
-import useAuthStore from '@/store/useAuthStore'
 
 const SEV = {
   critical: 'text-red-400 bg-red-500/10 border-red-500/20',
@@ -20,7 +19,6 @@ function CreateModal({ onClose, onCreated, servers }) {
   const [form, setForm] = useState({ title: '', severity: 'medium', impact: 'Medium', description: '', server_id: '', assignee: '' })
   const [loading, setLoading] = useState(false)
   const [error,   setError]   = useState(null)
-  const { getAuthHeader } = useAuthStore()
   const up = (k, v) => setForm(f => ({ ...f, [k]: v }))
 
   const submit = async (e) => {
@@ -30,12 +28,12 @@ function CreateModal({ onClose, onCreated, servers }) {
     try {
       const res = await fetch('/api/incidents', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...getAuthHeader() },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...form, server_name: servers.find(s => s.id === form.server_id)?.name || '' }),
       })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
-        throw new Error(data.detail || `Request failed (${res.status})`)
+        throw new Error(data.detail || `Error ${res.status}`)
       }
       await res.json()
       onCreated()
@@ -203,17 +201,15 @@ export default function IncidentsPage() {
   const [showCreate, setShowCreate] = useState(false)
   const [filter, setFilter]         = useState('all')
 
-  const { getAuthHeader } = useAuthStore()
-
   const load = async () => {
     setLoading(true)
     try {
-      const authH = getAuthHeader()
-      const [incRes, _] = await Promise.all([
-        fetch('/api/incidents', { headers: authH }).then(r => r.json()),
-        fetch('/api/incidents/auto-detect', { method: 'POST', headers: authH }),
-      ])
+      // auto-detect runs in background — don't let it block or crash the incident list
+      fetch('/api/incidents/auto-detect', { method: 'POST' }).catch(() => {})
+      const incRes = await fetch('/api/incidents').then(r => r.json())
       setIncidents(incRes.incidents || [])
+    } catch (e) {
+      console.error('load incidents:', e)
     } finally { setLoading(false) }
   }
 
@@ -224,7 +220,7 @@ export default function IncidentsPage() {
   const investing = incidents.filter(i => i.status === 'investigating').length
 
   const deleteInc = async (id) => {
-    await fetch(`/api/incidents/${id}`, { method: 'DELETE', headers: getAuthHeader() })
+    await fetch(`/api/incidents/${id}`, { method: 'DELETE' })
     load()
   }
 

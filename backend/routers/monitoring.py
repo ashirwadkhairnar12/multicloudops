@@ -141,10 +141,6 @@ async def get_alerts(db: AsyncSession = Depends(get_db)):
     return {"alerts": alerts, "total": len(alerts)}
 
 
-@router.get("/incidents")
-async def get_incidents():
-    return {"incidents": [], "total": 0}
-
 
 @router.get("/stats/overview")
 async def get_overview_stats(db: AsyncSession = Depends(get_db)):

@@ -1,15 +1,4 @@
 import { create } from 'zustand'
-import useAuthStore from '@/store/useAuthStore'
-
-// Helper: always include Bearer token in request options
-function authFetch(url, options = {}) {
-  const token = useAuthStore.getState().token
-  const headers = {
-    ...(options.headers || {}),
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-  }
-  return fetch(url, { ...options, headers })
-}
 
 const useCloudStore = create((set, get) => ({
   accounts:    [],
@@ -22,10 +11,9 @@ const useCloudStore = create((set, get) => ({
   fetchAccounts: async () => {
     set({ loading: true, error: null })
     try {
-      const res  = await authFetch('/api/cloud-accounts')
+      const res  = await fetch('/api/cloud-accounts')
       if (!res.ok) {
-        const msg = res.status === 401 ? 'Session expired — please log in again.' : `Server error ${res.status}`
-        set({ error: msg, loading: false })
+        set({ error: `Failed to load accounts (${res.status})`, loading: false })
         return
       }
       const data = await res.json()
@@ -36,7 +24,7 @@ const useCloudStore = create((set, get) => ({
   },
 
   createAccount: async (payload) => {
-    const res = await authFetch('/api/cloud-accounts', {
+    const res = await fetch('/api/cloud-accounts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -48,7 +36,7 @@ const useCloudStore = create((set, get) => ({
   },
 
   deleteAccount: async (id) => {
-    await authFetch(`/api/cloud-accounts/${id}`, { method: 'DELETE' })
+    await fetch(`/api/cloud-accounts/${id}`, { method: 'DELETE' })
     set(state => {
       const next = { ...state.accountData }
       delete next[id]
@@ -58,14 +46,14 @@ const useCloudStore = create((set, get) => ({
   },
 
   testConnection: async (id) => {
-    const res  = await authFetch(`/api/cloud-accounts/${id}/test`, { method: 'POST' })
+    const res  = await fetch(`/api/cloud-accounts/${id}/test`, { method: 'POST' })
     const data = await res.json()
     await get().fetchAccounts()
     return data
   },
 
   updatePollInterval: async (id, seconds) => {
-    const res = await authFetch(`/api/cloud-accounts/${id}/poll-interval`, {
+    const res = await fetch(`/api/cloud-accounts/${id}/poll-interval`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ poll_interval: seconds }),
@@ -78,15 +66,14 @@ const useCloudStore = create((set, get) => ({
   syncAccount: async (id) => {
     set({ syncingId: id })
     try {
-      // Use force-sync to bypass cache
-      const res  = await authFetch(`/api/cloud-accounts/${id}/force-sync`, { method: 'POST' })
+      const res  = await fetch(`/api/cloud-accounts/${id}/force-sync`, { method: 'POST' })
       const data = await res.json()
       await get().fetchAccounts()
       await get().loadAccountData(id)
       return data
     } catch (e) {
       // fallback to regular sync
-      const res  = await authFetch(`/api/cloud-accounts/${id}/sync`, { method: 'POST' })
+      const res  = await fetch(`/api/cloud-accounts/${id}/sync`, { method: 'POST' })
       const data = await res.json()
       await get().fetchAccounts()
       await get().loadAccountData(id)
@@ -99,10 +86,10 @@ const useCloudStore = create((set, get) => ({
   loadAccountData: async (id) => {
     try {
       const [resRes, costRes, secRes, optRes] = await Promise.all([
-        authFetch(`/api/cloud-accounts/${id}/resources`).then(r => r.json()),
-        authFetch(`/api/cloud-accounts/${id}/costs`).then(r => r.json()),
-        authFetch(`/api/cloud-accounts/${id}/security`).then(r => r.json()),
-        authFetch(`/api/cloud-accounts/${id}/optimisations`).then(r => r.json()),
+        fetch(`/api/cloud-accounts/${id}/resources`).then(r => r.json()),
+        fetch(`/api/cloud-accounts/${id}/costs`).then(r => r.json()),
+        fetch(`/api/cloud-accounts/${id}/security`).then(r => r.json()),
+        fetch(`/api/cloud-accounts/${id}/optimisations`).then(r => r.json()),
       ])
 
       const sec = secRes || {}
