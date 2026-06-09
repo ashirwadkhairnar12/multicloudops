@@ -874,6 +874,69 @@ def collect_costs(session) -> dict:
     return result
 
 
+def _parse_patch_output(output: str):
+    """Parse stdout from AWS-RunPatchBaseline to extract patch counts from apt-get output.
+    Ubuntu apt exits with code 1 when upgrades exist, making SSM mark it as Failed,
+    but the output is valid and contains the data we need.
+    """
+    import re
+    if not output:
+        return None
+    missing = installed = failed = 0
+    found = False
+
+    # "N packages can be upgraded"
+    m = re.search(r'(\d+) packages? can be upgraded', output)
+    if m:
+        missing = int(m.group(1))
+        found = True
+
+    # "0 upgraded, 0 newly installed, 0 to remove and N not upgraded"
+    m2 = re.search(r'and (\d+) not upgraded', output)
+    if m2 and not missing:
+        missing = int(m2.group(1))
+        found = True
+
+    # "N upgraded, N newly installed"
+    m3 = re.search(r'(\d+) upgraded,\s*(\d+) newly installed', output)
+    if m3:
+        installed = int(m3.group(1)) + int(m3.group(2))
+        found = True
+
+    if not found:
+        return None
+
+    patch_state = "compliant" if missing == 0 else "non_compliant"
+    return missing, installed, failed, patch_state
+
+
+def _patch_state_from_command_output(ssm, iid: str):
+    """Read the most recent AWS-RunPatchBaseline command output for this instance
+    and parse it to determine patch state. This is the only reliable method for
+    Ubuntu instances where Patch Manager doesn't store results."""
+    try:
+        resp = ssm.list_command_invocations(
+            InstanceId=iid,
+            Filters=[{"key": "DocumentName", "value": "AWS-RunPatchBaseline"}],
+            Details=True,
+            MaxResults=5,
+        )
+        invocations = sorted(
+            resp.get("CommandInvocations", []),
+            key=lambda x: x.get("RequestedDateTime", ""),
+            reverse=True,
+        )
+        for inv in invocations:
+            for plugin in inv.get("CommandPlugins", []):
+                output = plugin.get("Output", "") or plugin.get("StandardOutputContent", "")
+                parsed = _parse_patch_output(output)
+                if parsed is not None:
+                    return parsed
+    except Exception:
+        pass
+    return None
+
+
 # ── SSM ───────────────────────────────────────────────────────────────────────
 
 def collect_ssm(session, region: str) -> list:
@@ -928,21 +991,24 @@ def collect_ssm(session, region: str) -> list:
                     except Exception:
                         pass
 
+                # Method 3: Parse most recent RunPatchBaseline command output
+                # This is the reliable fallback for Ubuntu where Patch Manager
+                # doesn't store results (apt exits non-zero → SSM marks "Failed"
+                # but the stdout contains the real upgrade count)
+                if patch_state == "unknown":
+                    parsed = _patch_state_from_command_output(ssm, iid)
+                    if parsed is not None:
+                        missing_patches, installed_patches, failed_patches, patch_state = parsed
+
                 # Software inventory
                 software = []
+                software_count = 0
                 try:
                     inv = ssm.list_inventory_entries(
                         InstanceId=iid, TypeName="AWS:Application", MaxResults=50)
-                    software = [{"name":e.get("Name",""),"version":e.get("Version","")}
-                                for e in inv.get("Entries",[])]
-                except Exception:
-                    pass
-
-                # Network config (processes not available without custom inventory)
-                params_count = 0
-                try:
-                    params = ssm.describe_parameters(MaxResults=1)
-                    params_count = 1  # at least query succeeded
+                    entries        = inv.get("Entries", [])
+                    software       = [{"name": e.get("Name",""), "version": e.get("Version","")} for e in entries]
+                    software_count = inv.get("TotalCount", len(software))
                 except Exception:
                     pass
 
@@ -957,8 +1023,8 @@ def collect_ssm(session, region: str) -> list:
                     "missing_patches":  missing_patches,
                     "failed_patches":   failed_patches,
                     "installed_patches":installed_patches,
-                    "software":         software[:20],
-                    "software_count":   len(software),
+                    "software":         software[:50],
+                    "software_count":   software_count,
                     "region":           region,
                 })
     except Exception as e:
