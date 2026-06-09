@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { Cloud, Plus, RefreshCw, CheckCircle, AlertTriangle, Trash2, Play, ExternalLink,
          Server, Database, Zap, DollarSign, Shield, ChevronRight, ChevronDown, Wifi, WifiOff, X,
-         TrendingDown, Eye, Clock } from 'lucide-react'
+         TrendingDown, Eye, Clock, Package } from 'lucide-react'
 import { AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis,
          CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 import useCloudStore from '@/store/useCloudStore'
@@ -987,9 +987,21 @@ function SSMTab({ items, accountId }) {
                         ))}
                       </div>
                       {inst.patch_state === 'non_compliant' && inst.missing_patches > 0 && (
-                        <p className="text-xs text-red-400 mt-2">
-                          ⚠ {inst.missing_patches} package{inst.missing_patches !== 1 ? 's' : ''} need updating — run <strong>Sync Now</strong> after a patch scan to refresh.
-                        </p>
+                        <div className="mt-2 space-y-1">
+                          <p className="text-xs text-red-400">
+                            ⚠ {inst.missing_patches} package{inst.missing_patches !== 1 ? 's' : ''} need updating
+                          </p>
+                          {inst.missing_packages?.length > 0 && (
+                            <div className="max-h-32 overflow-y-auto space-y-0.5 mt-1">
+                              {inst.missing_packages.map((pkg, i) => (
+                                <div key={i} className="flex items-center gap-1.5 text-[11px] font-mono text-slate-300 bg-red-500/5 border border-red-500/10 rounded px-2 py-0.5">
+                                  <Package size={10} className="text-red-400 shrink-0" />
+                                  {pkg}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
                       )}
                       {inst.patch_state === 'compliant' && (
                         <p className="text-xs text-green-400 mt-2">✓ All patches up to date.</p>

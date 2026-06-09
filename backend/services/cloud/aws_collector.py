@@ -1010,10 +1010,11 @@ def collect_ssm(session, region: str) -> list:
                 # This is the reliable fallback for Ubuntu where Patch Manager
                 # doesn't store results (apt exits non-zero → SSM marks "Failed"
                 # but the stdout contains the real upgrade count)
+                missing_packages = []
                 if patch_state == "unknown":
                     parsed = _patch_state_from_command_output(ssm, iid)
                     if parsed is not None:
-                        missing_patches, installed_patches, failed_patches, patch_state, _ = parsed
+                        missing_patches, installed_patches, failed_patches, patch_state, missing_packages = parsed
 
                 # Software inventory
                 software = []
@@ -1038,6 +1039,7 @@ def collect_ssm(session, region: str) -> list:
                     "missing_patches":  missing_patches,
                     "failed_patches":   failed_patches,
                     "installed_patches":installed_patches,
+                    "missing_packages": missing_packages,
                     "software":         software[:50],
                     "software_count":   software_count,
                     "region":           region,
