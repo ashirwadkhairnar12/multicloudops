@@ -599,40 +599,239 @@ async def run_compliance_check(
     return data
 
 
-@router.get("/{account_id}/ssm/processes")
-async def get_ssm_processes(account_id: str, db: AsyncSession = Depends(get_db)):
+@router.post("/{account_id}/ssm/run-process-scan")
+async def run_process_scan(
+    account_id: str,
+    db: AsyncSession = Depends(get_db),
+):
     """
-    Return the cached process list for all SSM instances in this account.
-    Populated automatically from collect_ssm (requires AWS:ProcessDetails inventory type).
+    Send a RunCommand to one or all Online SSM instances to collect process list.
+    Runs `ps aux` on Linux, Get-Process on Windows.
+    Returns command_id(s) — poll /ssm/process-scan-result/{command_id} until done.
+
+    Optionally filter to a single instance:
+      POST body: { "instance_id": "i-0abc123" }   (omit to scan all)
+    """
+    from fastapi import Request
+    result = await db.execute(select(CloudAccount).where(CloudAccount.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if account.status != "active":
+        raise HTTPException(status_code=400, detail="Account not active")
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    def _run():
+        import json, botocore.exceptions
+        from services.cloud.aws_collector import _boto_session
+
+        regions = json.loads(account.regions) if account.regions else ["us-east-1"]
+        session = _boto_session({
+            "access_key": account.access_key,
+            "secret_key": account.secret_key,
+            "role_arn":   account.role_arn,
+        })
+
+        # Linux script — exits 0 always; structured between markers
+        LINUX_SCRIPT = r"""#!/bin/bash
+echo "MCO_PROCESS_START"
+ps aux --no-headers 2>/dev/null \
+  | awk '{
+      user=$1; pid=$2; cpu=$3; mem=$4;
+      cmd="";
+      for(i=11;i<=NF;i++) cmd=cmd" "$i;
+      gsub(/^ /,"",cmd);
+      printf "%s\t%s\t%s\t%s\t%s\n", user, pid, cpu, mem, cmd
+    }' \
+  | sort -t$'\t' -k3 -rn \
+  | head -60
+echo "MCO_PROCESS_END"
+exit 0
+"""
+
+        # Windows script — Get-Process gives CPU seconds not %; we normalise
+        # WorkingSet64 to KB for the parser (4 GB baseline on backend side)
+        WIN_SCRIPT = r"""
+Write-Output "MCO_WIN_PROCESS_START"
+Get-Process | Sort-Object CPU -Descending | Select-Object -First 60 |
+  ForEach-Object {
+    $cpu = if ($_.CPU) { [math]::Round($_.CPU, 1) } else { 0 }
+    $mem = [math]::Round($_.WorkingSet64 / 1KB, 0)
+    $user = try { $_.GetOwner().User } catch { "" }
+    "{0},{1},{2},{3},{4}" -f $_.ProcessName, $_.Id, $cpu, $mem, $user
+  }
+Write-Output "MCO_WIN_PROCESS_END"
+exit 0
+"""
+
+        commands = []
+        errors   = []
+
+        for region in regions:
+            try:
+                ssm_client = session.client("ssm", region_name=region)
+
+                # Discover Online instances
+                linux_ids   = []
+                windows_ids = []
+                next_token  = None
+                while True:
+                    kwargs = {"MaxResults": 50}
+                    if next_token:
+                        kwargs["NextToken"] = next_token
+                    resp = ssm_client.describe_instance_information(**kwargs)
+                    for inst in resp.get("InstanceInformationList", []):
+                        if inst.get("PingStatus") != "Online":
+                            continue
+                        iid      = inst["InstanceId"]
+                        platform = (inst.get("PlatformName") or "").lower()
+                        if "windows" in platform:
+                            windows_ids.append(iid)
+                        else:
+                            linux_ids.append(iid)
+                    next_token = resp.get("NextToken")
+                    if not next_token:
+                        break
+
+                # Send Linux batch
+                for i in range(0, len(linux_ids), 50):
+                    batch = linux_ids[i:i+50]
+                    try:
+                        r = ssm_client.send_command(
+                            InstanceIds=batch,
+                            DocumentName="AWS-RunShellScript",
+                            Parameters={"commands": [LINUX_SCRIPT]},
+                            Comment="MCO process scan",
+                            TimeoutSeconds=60,
+                        )
+                        commands.append({
+                            "region":     region,
+                            "command_id": r["Command"]["CommandId"],
+                            "instances":  len(batch),
+                            "platform":   "linux",
+                        })
+                    except botocore.exceptions.ClientError as e:
+                        errors.append(f"{region}/linux: {e.response['Error']['Message']}")
+
+                # Send Windows batch
+                for i in range(0, len(windows_ids), 50):
+                    batch = windows_ids[i:i+50]
+                    try:
+                        r = ssm_client.send_command(
+                            InstanceIds=batch,
+                            DocumentName="AWS-RunPowerShellScript",
+                            Parameters={"commands": [WIN_SCRIPT]},
+                            Comment="MCO process scan",
+                            TimeoutSeconds=60,
+                        )
+                        commands.append({
+                            "region":     region,
+                            "command_id": r["Command"]["CommandId"],
+                            "instances":  len(batch),
+                            "platform":   "windows",
+                        })
+                    except botocore.exceptions.ClientError as e:
+                        errors.append(f"{region}/windows: {e.response['Error']['Message']}")
+
+            except botocore.exceptions.ClientError as e:
+                errors.append(f"{region}: {e.response['Error']['Message']}")
+            except Exception as e:
+                errors.append(f"{region}: {str(e)}")
+
+        total = sum(c["instances"] for c in commands)
+        return {"commands": commands, "errors": errors, "total_instances": total}
+
+    data = await loop.run_in_executor(None, _run)
+    return {
+        "message":  f"Process scan sent to {data['total_instances']} instance(s)" if data["total_instances"] else "No online instances found",
+        "commands": data["commands"],
+        "errors":   data["errors"],
+    }
+
+
+@router.get("/{account_id}/ssm/process-scan-result/{command_id}")
+async def get_process_scan_result(
+    account_id: str,
+    command_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Poll a process-scan RunCommand and return parsed process lists per instance.
+    Returns:
+      status: "pending" | "done" | "partial"
+      by_instance: { instance_id: [ process, ... ] }
+      summary: { total_instances, completed, pending, failed }
     """
     result = await db.execute(select(CloudAccount).where(CloudAccount.id == account_id))
     account = result.scalar_one_or_none()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    from services.cloud.poller import _cache
-    cached = _cache.get(account.account_id) or _cache.get(account.id)
-    if not cached:
-        return {"processes": [], "message": "No data yet — trigger a sync first"}
+    import asyncio
+    loop = asyncio.get_event_loop()
 
-    ssm_data = cached["data"].get("ssm", [])
-    # Aggregate process lists keyed by instance_id
-    process_map = {}
-    for inst in ssm_data:
-        iid = inst.get("instance_id", "")
-        procs = inst.get("processes", [])
-        if procs:
-            process_map[iid] = procs
+    def _fetch():
+        import json
+        from services.cloud.aws_collector import _boto_session, _parse_process_output
 
-    # Build flat list of top processes across all instances (sorted by CPU)
-    all_procs = []
-    for iid, procs in process_map.items():
-        for p in procs:
-            all_procs.append({**p, "instance_id": iid})
-    all_procs.sort(key=lambda x: x.get("cpu", 0), reverse=True)
+        regions = json.loads(account.regions) if account.regions else ["us-east-1"]
+        session = _boto_session({
+            "access_key": account.access_key,
+            "secret_key": account.secret_key,
+            "role_arn":   account.role_arn,
+        })
 
-    return {
-        "by_instance": process_map,
-        "top_processes": all_procs[:50],
-        "instance_count": len(process_map),
-    }
+        by_instance  = {}
+        total = completed = pending = failed = 0
+
+        for region in regions:
+            try:
+                ssm_client = session.client("ssm", region_name=region)
+                resp = ssm_client.list_command_invocations(
+                    CommandId=command_id, Details=True
+                )
+                for inv in resp.get("CommandInvocations", []):
+                    iid    = inv["InstanceId"]
+                    status = inv.get("Status", "Pending")
+                    total += 1
+
+                    if status in ("Pending", "InProgress", "Delayed"):
+                        pending += 1
+                        continue
+                    if status in ("Failed", "Cancelled", "DeliveryTimedOut", "ExecutionTimedOut"):
+                        failed += 1
+                        continue
+
+                    # Success — parse output
+                    completed += 1
+                    output = ""
+                    for plugin in inv.get("CommandPlugins", []):
+                        output = plugin.get("Output", "") or plugin.get("StandardOutputContent", "")
+                        if output:
+                            break
+                    procs = _parse_process_output(output)
+                    if procs:
+                        by_instance[iid] = procs
+
+            except Exception:
+                continue
+
+        overall = (
+            "pending" if pending > 0 and completed == 0
+            else "partial" if pending > 0
+            else "done"
+        )
+        return {
+            "status":      overall,
+            "by_instance": by_instance,
+            "summary":     {
+                "total":     total,
+                "completed": completed,
+                "pending":   pending,
+                "failed":    failed,
+            },
+        }
+
+    return await loop.run_in_executor(None, _fetch)

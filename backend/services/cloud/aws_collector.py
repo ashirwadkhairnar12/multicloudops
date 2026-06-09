@@ -952,6 +952,133 @@ def _patch_state_from_command_output(ssm, iid: str):
     return None
 
 
+# ── SSM process output helpers ────────────────────────────────────────────────
+
+def _parse_process_output(output: str) -> list:
+    """
+    Parse stdout from our MCO process-scan RunCommand script.
+
+    Linux block (between MCO_PROCESS_START / MCO_PROCESS_END):
+        Each line is tab-separated: user pid cpu mem command...
+
+    Windows block (between MCO_WIN_PROCESS_START / MCO_WIN_PROCESS_END):
+        Each line is comma-separated CSV: name,pid,cpu,mem,user
+    """
+    import re
+
+    if not output:
+        return []
+
+    processes = []
+
+    # ── Linux ──────────────────────────────────────────────────────────────
+    linux_match = re.search(
+        r"MCO_PROCESS_START\r?\n(.*?)MCO_PROCESS_END",
+        output, re.DOTALL
+    )
+    if linux_match:
+        for raw_line in linux_match.group(1).splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            # format: user  pid  cpu  mem  command...
+            if len(parts) < 5:
+                continue
+            try:
+                user    = parts[0].strip()
+                pid     = parts[1].strip()
+                cpu_val = float(parts[2].strip())
+                mem_val = float(parts[3].strip())
+                command = " ".join(parts[4:]).strip()
+                # derive short process name from command
+                name = command.split()[0].split("/")[-1] if command else ""
+                status = (
+                    "critical" if cpu_val >= 85 or mem_val >= 85
+                    else "warning"  if cpu_val >= 70 or mem_val >= 70
+                    else "healthy"
+                )
+                processes.append({
+                    "pid":     pid,
+                    "name":    name,
+                    "cpu":     cpu_val,
+                    "mem":     mem_val,
+                    "user":    user,
+                    "command": command,
+                    "status":  status,
+                })
+            except (ValueError, IndexError):
+                continue
+
+    # ── Windows ────────────────────────────────────────────────────────────
+    win_match = re.search(
+        r"MCO_WIN_PROCESS_START\r?\n(.*?)MCO_WIN_PROCESS_END",
+        output, re.DOTALL
+    )
+    if win_match:
+        for raw_line in win_match.group(1).splitlines():
+            line = raw_line.strip().strip('"')
+            if not line or line.lower().startswith("name"):
+                continue
+            parts = [p.strip().strip('"') for p in line.split(",")]
+            if len(parts) < 4:
+                continue
+            try:
+                name    = parts[0]
+                pid     = parts[1]
+                cpu_val = float(parts[2]) if parts[2] else 0.0
+                mem_kb  = float(parts[3]) if parts[3] else 0.0
+                # Windows gives WorkingSet in KB; express as % of 4 GB baseline
+                mem_val = round((mem_kb / (4 * 1024 * 1024)) * 100, 1)
+                user    = parts[4] if len(parts) > 4 else ""
+                status  = (
+                    "critical" if cpu_val >= 85 or mem_val >= 85
+                    else "warning"  if cpu_val >= 70 or mem_val >= 70
+                    else "healthy"
+                )
+                processes.append({
+                    "pid":     pid,
+                    "name":    name,
+                    "cpu":     cpu_val,
+                    "mem":     mem_val,
+                    "user":    user,
+                    "command": name,
+                    "status":  status,
+                })
+            except (ValueError, IndexError):
+                continue
+
+    processes.sort(key=lambda x: x["cpu"], reverse=True)
+    return processes
+
+
+def _processes_from_command_output(ssm, iid: str) -> list:
+    """
+    Read the most recent MCO process-scan RunCommand output for this instance.
+    Returns [] if no scan has been run yet — the frontend will show a Scan button.
+    """
+    try:
+        resp = ssm.list_command_invocations(
+            InstanceId=iid,
+            Filters=[{"key": "DocumentName", "value": "AWS-RunShellScript"}],
+            Details=True,
+            MaxResults=10,
+        )
+        invocations = sorted(
+            resp.get("CommandInvocations", []),
+            key=lambda x: x.get("RequestedDateTime", ""),
+            reverse=True,
+        )
+        for inv in invocations:
+            for plugin in inv.get("CommandPlugins", []):
+                output = plugin.get("Output", "") or plugin.get("StandardOutputContent", "")
+                if "MCO_PROCESS_START" in output or "MCO_WIN_PROCESS_START" in output:
+                    return _parse_process_output(output)
+    except Exception:
+        pass
+    return []
+
+
 # ── SSM ───────────────────────────────────────────────────────────────────────
 
 def collect_ssm(session, region: str) -> list:
@@ -1041,41 +1168,13 @@ def collect_ssm(session, region: str) -> list:
                 except Exception:
                     pass
 
-                # ── Process list (AWS:NetworkConfig and AWS:RunningService) ────
-                # Attempt to collect via AWS:Application category (processes).
-                # SSM Inventory must have the "Process" inventory type enabled
-                # (AWS:ProcessDetails or custom). We try AWS:ProcessDetails first,
-                # then fall back to a Run Command invocation to get ps output.
-                processes = []
-                try:
-                    proc_inv = ssm.list_inventory_entries(
-                        InstanceId=iid, TypeName="AWS:ProcessDetails", MaxResults=50)
-                    for e in proc_inv.get("Entries", []):
-                        cpu_raw = e.get("CpuUsage", "0") or "0"
-                        mem_raw = e.get("MemoryUsage", "0") or "0"
-                        try:
-                            cpu_val = float(str(cpu_raw).rstrip("%"))
-                        except Exception:
-                            cpu_val = 0.0
-                        try:
-                            mem_val = float(str(mem_raw).rstrip("%"))
-                        except Exception:
-                            mem_val = 0.0
-                        processes.append({
-                            "pid":         e.get("Pid", ""),
-                            "name":        e.get("ProcessName", e.get("Name", "")),
-                            "cpu":         cpu_val,
-                            "mem":         mem_val,
-                            "user":        e.get("UserName", e.get("User", "")),
-                            "command":     e.get("CommandLine", ""),
-                            "status":      "warning" if cpu_val >= 70 or mem_val >= 70
-                                           else "critical" if cpu_val >= 85 or mem_val >= 85
-                                           else "healthy",
-                        })
-                    # Sort by CPU desc
-                    processes.sort(key=lambda x: x["cpu"], reverse=True)
-                except Exception:
-                    pass  # AWS:ProcessDetails not enabled — frontend will prompt to enable
+                # ── Process list via RunCommand output cache ───────────────────
+                # AWS:ProcessDetails is not available in the Inventory UI.
+                # Instead we parse the output of the most recent
+                # MCO process-scan RunCommand (AWS-RunShellScript with our
+                # MCO_PROCESS_START marker). The frontend triggers the scan
+                # on demand; we just read whatever is cached here.
+                processes = _processes_from_command_output(ssm, iid)
 
                 results.append({
                     "instance_id":      iid,

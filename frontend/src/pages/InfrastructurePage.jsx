@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react'
+import React, { useState, useEffect, useMemo, useRef } from 'react'
 import {
   Search, Bot, ArrowRight, Cloud, Server, Shield, Package,
   CheckCircle, AlertTriangle, X, RefreshCw, ChevronDown, Clock,
@@ -80,125 +80,288 @@ function ProcessAlertBanner({ processes, onTabSwitch }) {
 }
 
 // ── Processes Tab ─────────────────────────────────────────────────────────────
-function ProcessesTab({ ssm }) {
-  const [sortBy, setSortBy]     = useState('cpu')
-  const [filterStatus, setFilter] = useState('all')
+// Scan states: idle | scanning | polling | done | error
+function ProcessesTab({ ssm, accountId, instanceId }) {
+  const [sortBy,       setSortBy]      = useState('cpu')
+  const [filterStatus, setFilter]      = useState('all')
+  const [scanState,    setScanState]   = useState('idle')   // idle|scanning|polling|done|error
+  const [scanError,    setScanError]   = useState('')
+  const [commandIds,   setCommandIds]  = useState([])       // [{command_id, region, platform}]
+  const [processes,    setProcesses]   = useState(ssm?.processes || [])
+  const [pollSummary,  setPollSummary] = useState(null)     // {total, completed, pending, failed}
+  const [scannedAt,    setScannedAt]   = useState(null)
+  const pollRef = useRef(null)
+
+  // Seed from cached SSM data on mount
+  useEffect(() => {
+    if (ssm?.processes?.length) {
+      setProcesses(ssm.processes)
+      setScanState('done')
+    }
+  }, [])
+
+  // Cleanup polling on unmount
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current) }, [])
+
+  const stopPolling = () => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+  }
+
+  const pollResults = async (cmds) => {
+    // Poll all command_ids; merge by_instance across regions
+    let allProcesses = {}
+    let allDone = false
+
+    const check = async () => {
+      try {
+        const fetches = cmds.map(({ command_id }) =>
+          fetch(`/api/cloud-accounts/${accountId}/ssm/process-scan-result/${command_id}`)
+            .then(r => r.json())
+        )
+        const results = await Promise.all(fetches)
+
+        let total = 0, completed = 0, pending = 0, failed = 0
+        results.forEach(r => {
+          Object.assign(allProcesses, r.by_instance || {})
+          total     += r.summary?.total     || 0
+          completed += r.summary?.completed || 0
+          pending   += r.summary?.pending   || 0
+          failed    += r.summary?.failed    || 0
+        })
+
+        setPollSummary({ total, completed, pending, failed })
+
+        // Merge all instances — show the scanned instance first if known
+        const flat = Object.entries(allProcesses).flatMap(([iid, procs]) =>
+          procs.map(p => ({ ...p, instance_id: iid }))
+        )
+        // If we know the instanceId, show its processes first; else just by cpu
+        flat.sort((a, b) => {
+          if (instanceId && a.instance_id === instanceId && b.instance_id !== instanceId) return -1
+          if (instanceId && b.instance_id === instanceId && a.instance_id !== instanceId) return 1
+          return b.cpu - a.cpu
+        })
+        if (flat.length) setProcesses(flat)
+
+        allDone = results.every(r => r.status === 'done') || pending === 0
+        if (allDone) {
+          stopPolling()
+          setScanState('done')
+          setScannedAt(new Date())
+        }
+      } catch (e) {
+        stopPolling()
+        setScanError('Polling failed: ' + e.message)
+        setScanState('error')
+      }
+    }
+
+    await check()
+    if (!allDone) {
+      pollRef.current = setInterval(check, 4000)
+    }
+  }
+
+  const triggerScan = async () => {
+    if (!accountId) return
+    setScanState('scanning')
+    setScanError('')
+    setCommandIds([])
+    setProcesses([])
+    setPollSummary(null)
+    stopPolling()
+
+    try {
+      const res  = await fetch(`/api/cloud-accounts/${accountId}/ssm/run-process-scan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      const data = await res.json()
+
+      if (!data.commands?.length) {
+        setScanError(data.errors?.join('; ') || 'No online instances found to scan.')
+        setScanState('error')
+        return
+      }
+
+      setCommandIds(data.commands)
+      setScanState('polling')
+      await pollResults(data.commands)
+    } catch (e) {
+      setScanError(e.message)
+      setScanState('error')
+    }
+  }
 
   if (!ssm) return <EmptySSMState />
 
-  const processes = ssm.processes || []
-
-  if (!processes.length) {
-    return (
-      <div className="flex flex-col items-center py-14 text-center">
-        <Terminal size={32} className="text-slate-600 mb-3" />
-        <p className="text-white font-medium text-sm">No process data available</p>
-        <p className="text-slate-400 text-xs mt-2 max-w-xs leading-relaxed">
-          Enable <span className="font-mono text-slate-300">AWS:ProcessDetails</span> in SSM Inventory
-          to collect per-process CPU &amp; memory. Go to AWS Systems Manager → Inventory → Edit Inventory.
-        </p>
-        <a
-          href="https://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-inventory-configuring.html"
-          target="_blank" rel="noreferrer"
-          className="mt-3 text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1"
-        >
-          AWS docs <ExternalLink size={10} />
-        </a>
-      </div>
-    )
-  }
+  const isRunning     = scanState === 'scanning' || scanState === 'polling'
+  const criticalCount = processes.filter(p => p.status === 'critical').length
+  const warningCount  = processes.filter(p => p.status === 'warning').length
 
   const sorted = [...processes]
     .filter(p => filterStatus === 'all' || p.status === filterStatus)
     .sort((a, b) => sortBy === 'cpu' ? b.cpu - a.cpu : b.mem - a.mem)
 
-  const criticalCount = processes.filter(p => p.status === 'critical').length
-  const warningCount  = processes.filter(p => p.status === 'warning').length
-
   return (
     <div className="space-y-3">
-      {/* Summary row */}
-      <div className="grid grid-cols-3 gap-2">
-        {[
-          { label: 'Total',    value: processes.length, color: 'text-slate-300' },
-          { label: 'Warning',  value: warningCount,  color: warningCount  > 0 ? 'text-yellow-400' : 'text-slate-400' },
-          { label: 'Critical', value: criticalCount, color: criticalCount > 0 ? 'text-red-400'    : 'text-slate-400' },
-        ].map(({ label, value, color }) => (
-          <div key={label} className="bg-bg-card border border-white/10 rounded-xl p-3 text-center">
-            <p className={`text-xl font-bold ${color}`}>{value}</p>
-            <p className="text-[10px] text-slate-500 mt-1">{label}</p>
+
+      {/* ── Scan controls bar ── */}
+      <div className="flex items-center justify-between gap-3 bg-bg-card border border-white/10 rounded-xl px-4 py-3">
+        <div className="flex-1 min-w-0">
+          {scanState === 'idle' && (
+            <p className="text-xs text-slate-400">
+              Runs <span className="font-mono text-slate-300">ps aux</span> via SSM RunCommand — no extra AWS cost.
+            </p>
+          )}
+          {scanState === 'scanning' && (
+            <p className="text-xs text-slate-400 flex items-center gap-2">
+              <Loader size={11} className="animate-spin text-blue-400" />
+              Sending command to instances…
+            </p>
+          )}
+          {scanState === 'polling' && (
+            <p className="text-xs text-slate-400 flex items-center gap-2">
+              <Loader size={11} className="animate-spin text-blue-400" />
+              {pollSummary
+                ? `${pollSummary.completed}/${pollSummary.total} done, ${pollSummary.pending} pending…`
+                : 'Waiting for results…'}
+            </p>
+          )}
+          {scanState === 'done' && (
+            <p className="text-xs text-green-400 flex items-center gap-1.5">
+              <CheckCircle size={11} />
+              {processes.length} processes collected
+              {scannedAt && <span className="text-slate-500 ml-1">· {scannedAt.toLocaleTimeString()}</span>}
+              {pollSummary?.failed > 0 && (
+                <span className="text-yellow-400 ml-1">· {pollSummary.failed} instance(s) failed</span>
+              )}
+            </p>
+          )}
+          {scanState === 'error' && (
+            <p className="text-xs text-red-400 flex items-center gap-1.5 truncate">
+              <AlertCircle size={11} className="shrink-0" />
+              {scanError || 'Scan failed'}
+            </p>
+          )}
+        </div>
+
+        <button
+          onClick={triggerScan}
+          disabled={isRunning || !accountId}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/30 border border-blue-500/30 text-blue-400 rounded-lg text-xs font-medium transition-colors disabled:opacity-40 shrink-0"
+        >
+          {isRunning
+            ? <><Loader size={11} className="animate-spin" /> Scanning…</>
+            : <><Play size={11} /> {scanState === 'done' ? 'Re-scan' : 'Scan Processes'}</>
+          }
+        </button>
+      </div>
+
+      {/* ── No data yet ── */}
+      {!processes.length && !isRunning && (
+        <div className="flex flex-col items-center py-10 text-center">
+          <Terminal size={28} className="text-slate-600 mb-3" />
+          <p className="text-slate-400 text-xs max-w-xs leading-relaxed">
+            Click <span className="text-white font-medium">Scan Processes</span> to run{' '}
+            <span className="font-mono text-slate-300">ps aux</span> on this instance via SSM RunCommand.
+            Results appear in ~10 seconds.
+          </p>
+          {!accountId && (
+            <p className="text-yellow-400 text-xs mt-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg px-3 py-2">
+              ⚠ No cloud account linked — scan unavailable.
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* ── Process list ── */}
+      {processes.length > 0 && (
+        <>
+          {/* Summary cards */}
+          <div className="grid grid-cols-3 gap-2">
+            {[
+              { label: 'Total',    value: processes.length, color: 'text-slate-300' },
+              { label: 'Warning',  value: warningCount,  color: warningCount  > 0 ? 'text-yellow-400' : 'text-slate-400' },
+              { label: 'Critical', value: criticalCount, color: criticalCount > 0 ? 'text-red-400'    : 'text-slate-400' },
+            ].map(({ label, value, color }) => (
+              <div key={label} className="bg-bg-card border border-white/10 rounded-xl p-3 text-center">
+                <p className={`text-xl font-bold ${color}`}>{value}</p>
+                <p className="text-[10px] text-slate-500 mt-1">{label}</p>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
 
-      {/* Controls */}
-      <div className="flex items-center gap-2">
-        <div className="flex items-center gap-1 bg-bg-card border border-white/10 rounded-lg p-0.5 text-xs">
-          {['all', 'critical', 'warning', 'healthy'].map(f => (
-            <button key={f} onClick={() => setFilter(f)}
-              className={`px-2 py-1 rounded capitalize transition-colors ${
-                filterStatus === f ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-white'
-              }`}>{f}</button>
-          ))}
-        </div>
-        <div className="flex items-center gap-1 bg-bg-card border border-white/10 rounded-lg p-0.5 text-xs ml-auto">
-          {['cpu', 'mem'].map(s => (
-            <button key={s} onClick={() => setSortBy(s)}
-              className={`px-2 py-1 rounded uppercase transition-colors ${
-                sortBy === s ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-white'
-              }`}>{s}</button>
-          ))}
-        </div>
-      </div>
-
-      {/* Process list */}
-      <div className="space-y-1 max-h-80 overflow-y-auto pr-1">
-        {sorted.length === 0 ? (
-          <p className="text-xs text-slate-500 text-center py-6">No processes match this filter.</p>
-        ) : sorted.map((proc, i) => {
-          const isCritical = proc.status === 'critical'
-          const isWarning  = proc.status === 'warning'
-          const rowBg = isCritical
-            ? 'border-red-500/20 bg-red-500/5'
-            : isWarning
-            ? 'border-yellow-500/20 bg-yellow-500/5'
-            : 'border-white/5 bg-transparent hover:bg-white/5'
-
-          return (
-            <div key={i} className={`flex items-center gap-3 px-3 py-2 rounded-lg border ${rowBg} transition-colors`}>
-              <StatusDot status={proc.status} />
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-mono text-white truncate">{proc.name || '—'}</span>
-                  {proc.pid && <span className="text-[10px] text-slate-600 shrink-0">PID {proc.pid}</span>}
-                  {proc.user && <span className="text-[10px] text-slate-500 shrink-0 font-mono">{proc.user}</span>}
-                </div>
-                {proc.command && (
-                  <div className="text-[10px] text-slate-600 truncate mt-0.5 font-mono">{proc.command}</div>
-                )}
-              </div>
-              <div className="shrink-0 text-right w-36">
-                <div className="flex items-center justify-end gap-3">
-                  <div className="text-right">
-                    <div className="text-[10px] text-slate-500 mb-0.5">CPU</div>
-                    <div className={`text-xs font-mono font-bold ${isCritical ? 'text-red-400' : isWarning ? 'text-yellow-400' : 'text-slate-300'}`}>
-                      {proc.cpu.toFixed(1)}%
-                    </div>
-                    <MiniBar value={proc.cpu} color={getCpuColor(proc.cpu)} />
-                  </div>
-                  <div className="text-right">
-                    <div className="text-[10px] text-slate-500 mb-0.5">MEM</div>
-                    <div className={`text-xs font-mono font-bold ${isCritical ? 'text-red-400' : isWarning ? 'text-yellow-400' : 'text-slate-300'}`}>
-                      {proc.mem.toFixed(1)}%
-                    </div>
-                    <MiniBar value={proc.mem} color={getCpuColor(proc.mem)} />
-                  </div>
-                </div>
-              </div>
+          {/* Filter + sort controls */}
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1 bg-bg-card border border-white/10 rounded-lg p-0.5 text-xs">
+              {['all', 'critical', 'warning', 'healthy'].map(f => (
+                <button key={f} onClick={() => setFilter(f)}
+                  className={`px-2 py-1 rounded capitalize transition-colors ${
+                    filterStatus === f ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-white'
+                  }`}>{f}</button>
+              ))}
             </div>
-          )
-        })}
-      </div>
+            <div className="flex items-center gap-1 bg-bg-card border border-white/10 rounded-lg p-0.5 text-xs ml-auto">
+              {['cpu', 'mem'].map(s => (
+                <button key={s} onClick={() => setSortBy(s)}
+                  className={`px-2 py-1 rounded uppercase transition-colors ${
+                    sortBy === s ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-white'
+                  }`}>{s}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Rows */}
+          <div className="space-y-1 max-h-72 overflow-y-auto pr-1">
+            {sorted.length === 0 ? (
+              <p className="text-xs text-slate-500 text-center py-6">No processes match this filter.</p>
+            ) : sorted.map((proc, i) => {
+              const isCritical = proc.status === 'critical'
+              const isWarning  = proc.status === 'warning'
+              const rowBg = isCritical
+                ? 'border-red-500/20 bg-red-500/5'
+                : isWarning
+                ? 'border-yellow-500/20 bg-yellow-500/5'
+                : 'border-white/5 bg-transparent hover:bg-white/5'
+
+              return (
+                <div key={i} className={`flex items-center gap-3 px-3 py-2 rounded-lg border ${rowBg} transition-colors`}>
+                  <StatusDot status={proc.status} />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs font-mono text-white truncate">{proc.name || '—'}</span>
+                      {proc.pid  && <span className="text-[10px] text-slate-600 shrink-0">PID {proc.pid}</span>}
+                      {proc.user && <span className="text-[10px] text-slate-500 shrink-0 font-mono">{proc.user}</span>}
+                    </div>
+                    {proc.command && proc.command !== proc.name && (
+                      <div className="text-[10px] text-slate-600 truncate mt-0.5 font-mono">{proc.command}</div>
+                    )}
+                  </div>
+                  <div className="shrink-0 w-36">
+                    <div className="flex items-center justify-end gap-3">
+                      <div className="text-right">
+                        <div className="text-[10px] text-slate-500 mb-0.5">CPU</div>
+                        <div className={`text-xs font-mono font-bold ${isCritical ? 'text-red-400' : isWarning ? 'text-yellow-400' : 'text-slate-300'}`}>
+                          {proc.cpu.toFixed(1)}%
+                        </div>
+                        <MiniBar value={proc.cpu} color={getCpuColor(proc.cpu)} />
+                      </div>
+                      <div className="text-right">
+                        <div className="text-[10px] text-slate-500 mb-0.5">MEM</div>
+                        <div className={`text-xs font-mono font-bold ${isCritical ? 'text-red-400' : isWarning ? 'text-yellow-400' : 'text-slate-300'}`}>
+                          {proc.mem.toFixed(1)}%
+                        </div>
+                        <MiniBar value={proc.mem} color={getCpuColor(proc.mem)} />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </>
+      )}
     </div>
   )
 }
@@ -679,7 +842,7 @@ function CloudInstanceModal({ instance, ssmData, accountId, onClose }) {
           )}
 
           {/* ── Processes ── */}
-          {tab === 'processes' && <ProcessesTab ssm={ssm} />}
+          {tab === 'processes' && <ProcessesTab ssm={ssm} accountId={accountId} instanceId={instance?.id} />}
 
           {/* ── Patches ── */}
           {tab === 'patches' && (
