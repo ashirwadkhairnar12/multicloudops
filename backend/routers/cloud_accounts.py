@@ -544,3 +544,95 @@ async def get_command_status(account_id: str, command_id: str, db: AsyncSession 
         return {"command_id": command_id, "statuses": {}, "total": 0}
 
     return await loop.run_in_executor(None, _check)
+
+
+# ── SSM: Custom Compliance Check ──────────────────────────────────────────────
+
+class ComplianceCheckRequest(BaseModel):
+    package:  str              # e.g. "nginx"
+    operator: str = ">="      # >, >=, <, <=, ==, !=
+    version:  str              # e.g. "1.24.0"
+    label:    Optional[str] = None
+
+
+@router.post("/{account_id}/ssm/compliance-check")
+async def run_compliance_check(
+    account_id: str,
+    payload: ComplianceCheckRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Run a custom compliance check across all SSM-managed instances.
+    Example: is nginx >= 1.24 installed on every server?
+
+    POST body:
+      { "package": "nginx", "operator": ">=", "version": "1.24.0" }
+    """
+    result = await db.execute(select(CloudAccount).where(CloudAccount.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if account.status != "active":
+        raise HTTPException(status_code=400, detail="Account not active — connect and sync first")
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    def _run():
+        from services.cloud.aws_collector import run_ssm_compliance_check
+        acc_dict = {
+            "access_key":  account.access_key,
+            "secret_key":  account.secret_key,
+            "role_arn":    account.role_arn,
+            "regions":     account.regions,
+            "account_id":  account.account_id,
+        }
+        check = {
+            "package":  payload.package,
+            "operator": payload.operator,
+            "version":  payload.version,
+            "label":    payload.label or f"{payload.package} {payload.operator} {payload.version}",
+        }
+        return run_ssm_compliance_check(acc_dict, check)
+
+    data = await loop.run_in_executor(None, _run)
+    return data
+
+
+@router.get("/{account_id}/ssm/processes")
+async def get_ssm_processes(account_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Return the cached process list for all SSM instances in this account.
+    Populated automatically from collect_ssm (requires AWS:ProcessDetails inventory type).
+    """
+    result = await db.execute(select(CloudAccount).where(CloudAccount.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    from services.cloud.poller import _cache
+    cached = _cache.get(account.account_id) or _cache.get(account.id)
+    if not cached:
+        return {"processes": [], "message": "No data yet — trigger a sync first"}
+
+    ssm_data = cached["data"].get("ssm", [])
+    # Aggregate process lists keyed by instance_id
+    process_map = {}
+    for inst in ssm_data:
+        iid = inst.get("instance_id", "")
+        procs = inst.get("processes", [])
+        if procs:
+            process_map[iid] = procs
+
+    # Build flat list of top processes across all instances (sorted by CPU)
+    all_procs = []
+    for iid, procs in process_map.items():
+        for p in procs:
+            all_procs.append({**p, "instance_id": iid})
+    all_procs.sort(key=lambda x: x.get("cpu", 0), reverse=True)
+
+    return {
+        "by_instance": process_map,
+        "top_processes": all_procs[:50],
+        "instance_count": len(process_map),
+    }

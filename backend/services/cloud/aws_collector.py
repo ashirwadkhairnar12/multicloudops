@@ -978,7 +978,7 @@ def collect_ssm(session, region: str) -> list:
                 except Exception:
                     pass
 
-                # Fallback: read from SSM Compliance API (written by RunPatchBaselineAssociation)
+                # Fallback: read from SSM Compliance API
                 if patch_state == "unknown":
                     try:
                         comp = ssm.list_compliance_items(
@@ -1007,26 +1007,75 @@ def collect_ssm(session, region: str) -> list:
                         pass
 
                 # Method 3: Parse most recent RunPatchBaseline command output
-                # This is the reliable fallback for Ubuntu where Patch Manager
-                # doesn't store results (apt exits non-zero → SSM marks "Failed"
-                # but the stdout contains the real upgrade count)
                 missing_packages = []
                 if patch_state == "unknown":
                     parsed = _patch_state_from_command_output(ssm, iid)
                     if parsed is not None:
                         missing_patches, installed_patches, failed_patches, patch_state, missing_packages = parsed
 
-                # Software inventory
+                # ── Full software inventory (AWS:Application) ──────────────────
+                # Paginate to collect ALL packages, not just the first 50.
+                # Each entry includes Name, Version, Publisher, InstalledTime.
                 software = []
                 software_count = 0
                 try:
-                    inv = ssm.list_inventory_entries(
-                        InstanceId=iid, TypeName="AWS:Application", MaxResults=50)
-                    entries        = inv.get("Entries", [])
-                    software       = [{"name": e.get("Name",""), "version": e.get("Version","")} for e in entries]
-                    software_count = inv.get("TotalCount", len(software))
+                    inv_kwargs = {"InstanceId": iid, "TypeName": "AWS:Application", "MaxResults": 50}
+                    while True:
+                        inv = ssm.list_inventory_entries(**inv_kwargs)
+                        entries = inv.get("Entries", [])
+                        for e in entries:
+                            installed_time = e.get("InstalledTime", "") or e.get("InstallTime", "")
+                            software.append({
+                                "name":           e.get("Name", ""),
+                                "version":        e.get("Version", ""),
+                                "publisher":      e.get("Publisher", ""),
+                                "installed_time": installed_time,
+                            })
+                        next_token = inv.get("NextToken")
+                        if not next_token:
+                            break
+                        inv_kwargs["NextToken"] = next_token
+                    software_count = len(software)
+                    # Sort by name for consistent ordering
+                    software.sort(key=lambda x: x["name"].lower())
                 except Exception:
                     pass
+
+                # ── Process list (AWS:NetworkConfig and AWS:RunningService) ────
+                # Attempt to collect via AWS:Application category (processes).
+                # SSM Inventory must have the "Process" inventory type enabled
+                # (AWS:ProcessDetails or custom). We try AWS:ProcessDetails first,
+                # then fall back to a Run Command invocation to get ps output.
+                processes = []
+                try:
+                    proc_inv = ssm.list_inventory_entries(
+                        InstanceId=iid, TypeName="AWS:ProcessDetails", MaxResults=50)
+                    for e in proc_inv.get("Entries", []):
+                        cpu_raw = e.get("CpuUsage", "0") or "0"
+                        mem_raw = e.get("MemoryUsage", "0") or "0"
+                        try:
+                            cpu_val = float(str(cpu_raw).rstrip("%"))
+                        except Exception:
+                            cpu_val = 0.0
+                        try:
+                            mem_val = float(str(mem_raw).rstrip("%"))
+                        except Exception:
+                            mem_val = 0.0
+                        processes.append({
+                            "pid":         e.get("Pid", ""),
+                            "name":        e.get("ProcessName", e.get("Name", "")),
+                            "cpu":         cpu_val,
+                            "mem":         mem_val,
+                            "user":        e.get("UserName", e.get("User", "")),
+                            "command":     e.get("CommandLine", ""),
+                            "status":      "warning" if cpu_val >= 70 or mem_val >= 70
+                                           else "critical" if cpu_val >= 85 or mem_val >= 85
+                                           else "healthy",
+                        })
+                    # Sort by CPU desc
+                    processes.sort(key=lambda x: x["cpu"], reverse=True)
+                except Exception:
+                    pass  # AWS:ProcessDetails not enabled — frontend will prompt to enable
 
                 results.append({
                     "instance_id":      iid,
@@ -1040,13 +1089,130 @@ def collect_ssm(session, region: str) -> list:
                     "failed_patches":   failed_patches,
                     "installed_patches":installed_patches,
                     "missing_packages": missing_packages,
-                    "software":         software[:50],
+                    "software":         software,           # full list, all pages
                     "software_count":   software_count,
+                    "processes":        processes,          # from AWS:ProcessDetails
                     "region":           region,
                 })
     except Exception as e:
         logger.warning(f"SSM collect error {region}: {e}")
     return results
+
+
+def run_ssm_compliance_check(account: dict, check: dict) -> dict:
+    """
+    Run a custom compliance check against all SSM-managed instances.
+
+    check = {
+        "package":   "nginx",          # package name to look for (case-insensitive)
+        "operator":  ">=",             # >, >=, <, <=, ==, !=
+        "version":   "1.24.0",         # version string to compare against
+        "label":     "nginx >= 1.24",  # human-readable label
+    }
+
+    Returns a list of per-instance results with pass/fail/missing status.
+    """
+    import json, re
+    from packaging.version import Version, InvalidVersion
+
+    def _ver_compare(installed: str, op: str, target: str) -> bool:
+        """Compare version strings using packaging.version if available."""
+        try:
+            iv = Version(installed)
+            tv = Version(target)
+            return {
+                ">":  iv >  tv, ">=": iv >= tv,
+                "<":  iv <  tv, "<=": iv <= tv,
+                "==": iv == tv, "!=": iv != tv,
+            }.get(op, False)
+        except (InvalidVersion, Exception):
+            # Fallback: lexicographic comparison of dot-split tuples
+            def _pad(v):
+                parts = re.split(r"[.\-]", v)
+                return [int(p) if p.isdigit() else p for p in parts]
+            try:
+                iv_t, tv_t = _pad(installed), _pad(target)
+                return {
+                    ">":  iv_t >  tv_t, ">=": iv_t >= tv_t,
+                    "<":  iv_t <  tv_t, "<=": iv_t <= tv_t,
+                    "==": iv_t == tv_t, "!=": iv_t != tv_t,
+                }.get(op, False)
+            except Exception:
+                return False
+
+    package  = (check.get("package") or "").strip().lower()
+    operator = check.get("operator", ">=")
+    version  = (check.get("version") or "").strip()
+
+    if not package or not version:
+        return {"error": "package and version are required"}
+
+    raw_regions = account.get("regions", '["us-east-1"]')
+    if isinstance(raw_regions, list):
+        regions = raw_regions
+    else:
+        try:
+            regions = json.loads(raw_regions)
+        except Exception:
+            regions = ["us-east-1"]
+
+    session = _boto_session(account)
+    results = []
+
+    for region in regions:
+        ssm = _client(session, "ssm", region)
+        try:
+            for page in ssm.get_paginator("describe_instance_information").paginate():
+                for inst in page["InstanceInformationList"]:
+                    iid = inst["InstanceId"]
+                    # Collect software for this instance
+                    installed_version = None
+                    try:
+                        inv_kwargs = {"InstanceId": iid, "TypeName": "AWS:Application", "MaxResults": 50}
+                        while True:
+                            inv = ssm.list_inventory_entries(**inv_kwargs)
+                            for e in inv.get("Entries", []):
+                                if e.get("Name", "").lower() == package:
+                                    installed_version = e.get("Version", "")
+                                    break
+                            if installed_version is not None:
+                                break
+                            next_token = inv.get("NextToken")
+                            if not next_token:
+                                break
+                            inv_kwargs["NextToken"] = next_token
+                    except Exception:
+                        pass
+
+                    if installed_version is None:
+                        status = "missing"
+                        passed = False
+                    else:
+                        passed = _ver_compare(installed_version, operator, version)
+                        status = "pass" if passed else "fail"
+
+                    results.append({
+                        "instance_id":        iid,
+                        "platform":           inst.get("PlatformName", ""),
+                        "ping_status":        inst.get("PingStatus", ""),
+                        "region":             region,
+                        "installed_version":  installed_version,
+                        "status":             status,
+                        "passed":             passed,
+                    })
+        except Exception as e:
+            logger.warning(f"Compliance check error {region}: {e}")
+
+    total   = len(results)
+    passing = sum(1 for r in results if r["passed"])
+    failing = sum(1 for r in results if r["status"] == "fail")
+    missing = sum(1 for r in results if r["status"] == "missing")
+
+    return {
+        "check":   check,
+        "summary": {"total": total, "passing": passing, "failing": failing, "missing": missing},
+        "results": results,
+    }
 
 
 # ── Security ──────────────────────────────────────────────────────────────────
