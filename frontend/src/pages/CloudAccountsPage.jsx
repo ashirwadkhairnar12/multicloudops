@@ -838,16 +838,26 @@ function SSMTab({ items, accountId }) {
                     : 'Pending…'}
                 </p>
                 {failures.map((f, i) => (
-                  <div key={i} className="mt-1 ml-3 bg-red-500/10 border border-red-500/20 rounded-lg p-2 space-y-1">
-                    <p className="text-red-400 font-mono">{f.instance_id} — {f.status_detail || f.status}</p>
-                    {f.output ? (
-                      <p className="text-slate-400 font-mono whitespace-pre-wrap break-all">{f.output}</p>
+                  <div key={i} className="mt-1 ml-3 bg-slate-500/10 border border-slate-500/20 rounded-lg p-2 space-y-1">
+                    <p className="font-mono text-slate-300">{f.instance_id}
+                      <span className={`ml-2 text-xs px-1.5 py-0.5 rounded ${
+                        f.status === 'Terminated' ? 'bg-yellow-500/20 text-yellow-400' : 'bg-red-500/20 text-red-400'
+                      }`}>{f.status}</span>
+                    </p>
+                    {f.status === 'Terminated' ? (
+                      <div className="text-slate-400 space-y-0.5 text-[11px]">
+                        <p className="text-yellow-400">⏱ Command timed out mid-execution (apt-get update was still downloading packages)</p>
+                        <p>This is normal on first run or slow connections. The patch data from the previous scan is still used.</p>
+                        <p>The patch counts shown in the SSM tab are from the last <em>completed</em> scan.</p>
+                      </div>
+                    ) : f.output ? (
+                      <p className="text-slate-400 font-mono text-[11px] whitespace-pre-wrap break-all">{f.output}</p>
                     ) : (
-                      <div className="text-slate-400 space-y-0.5">
+                      <div className="text-slate-400 space-y-0.5 text-[11px]">
                         <p>Likely causes:</p>
-                        <p>① Instance profile missing <code className="text-yellow-300">AmazonSSMManagedInstanceCore</code> policy</p>
-                        <p>② No internet / VPC endpoint for <code className="text-yellow-300">ssm.{cmd.region}.amazonaws.com</code></p>
-                        <p>③ SSM Agent version too old — run <code className="text-yellow-300">sudo systemctl restart amazon-ssm-agent</code></p>
+                        <p>① Instance profile missing <code className="text-yellow-300">AmazonSSMManagedInstanceCore</code></p>
+                        <p>② No VPC endpoint / NAT for <code className="text-yellow-300">ssm.{cmd.region}.amazonaws.com</code></p>
+                        <p>③ SSM Agent too old — run <code className="text-yellow-300">sudo systemctl restart amazon-ssm-agent</code></p>
                       </div>
                     )}
                   </div>
@@ -856,7 +866,13 @@ function SSMTab({ items, accountId }) {
             )
           })}
           {scanResult.errors?.length > 0 && (
-            <p className="text-yellow-400">⚠ {scanResult.errors.join(', ')}</p>
+            <div className="space-y-0.5">
+              {scanResult.errors.map((err, i) => (
+                <p key={i} className={err.includes('No managed instances') ? 'text-slate-500' : 'text-yellow-400'}>
+                  {err.includes('No managed instances') ? 'ℹ' : '⚠'} {err}
+                </p>
+              ))}
+            </div>
           )}
         </div>
       )}
@@ -954,13 +970,13 @@ function SSMTab({ items, accountId }) {
                     </div>
                   )}
 
-                  {/* Patch breakdown */}
-                  {inst.patch_state !== 'unknown' && (
+                  {/* Patch breakdown — show whenever we have any patch data */}
+                  {(inst.patch_state !== 'unknown' || inst.missing_patches > 0 || inst.installed_patches > 0) ? (
                     <div>
                       <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-2">Patch Summary</p>
                       <div className="grid grid-cols-3 gap-2">
                         {[
-                          { label: 'Installed', value: inst.installed_patches, color: 'text-green-400'  },
+                          { label: 'Installed', value: inst.installed_patches, color: 'text-green-400' },
                           { label: 'Missing',   value: inst.missing_patches,   color: (inst.missing_patches||0) > 0 ? 'text-red-400' : 'text-slate-300' },
                           { label: 'Failed',    value: inst.failed_patches,    color: (inst.failed_patches||0)  > 0 ? 'text-red-400' : 'text-slate-300' },
                         ].map(({ label, value, color }) => (
@@ -970,18 +986,18 @@ function SSMTab({ items, accountId }) {
                           </div>
                         ))}
                       </div>
-                      {inst.patch_state === 'unknown' && (
-                        <p className="text-xs text-yellow-400 mt-2">
-                          ⚠ Patch data unavailable — click "Run Patch Scan" above to trigger a baseline scan.
+                      {inst.patch_state === 'non_compliant' && inst.missing_patches > 0 && (
+                        <p className="text-xs text-red-400 mt-2">
+                          ⚠ {inst.missing_patches} package{inst.missing_patches !== 1 ? 's' : ''} need updating — run <strong>Sync Now</strong> after a patch scan to refresh.
                         </p>
                       )}
+                      {inst.patch_state === 'compliant' && (
+                        <p className="text-xs text-green-400 mt-2">✓ All patches up to date.</p>
+                      )}
                     </div>
-                  )}
-
-                  {inst.patch_state === 'unknown' && (
+                  ) : (
                     <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-3 text-xs text-yellow-400">
-                      ⚠ Patch state unknown — AWS Patch Manager hasn't run a scan on this instance yet.
-                      Use <strong>Run Patch Scan</strong> above to trigger <code>AWS-RunPatchBaseline</code>.
+                      ⚠ Patch state unknown — click <strong>Run Patch Scan</strong> above, wait ~5 min, then click <strong>Sync Now</strong>.
                     </div>
                   )}
 

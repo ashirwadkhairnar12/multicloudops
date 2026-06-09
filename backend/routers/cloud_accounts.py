@@ -399,7 +399,7 @@ async def run_patch_scan(account_id: str, db: AsyncSession = Depends(get_db)):
                             break
 
                     if not instance_ids:
-                        errors.append(f"{region}: No managed instances found (check IAM permissions or SSM Agent status)")
+                        # Silently skip — having no instances in a region is normal
                         continue
 
                     # Send scan command in batches of 50 (AWS hard limit)
@@ -414,7 +414,7 @@ async def run_patch_scan(account_id: str, db: AsyncSession = Depends(get_db)):
                                 DocumentName="AWS-RunPatchBaseline",
                                 Parameters={"Operation": ["Scan"]},
                                 Comment="Patch scan by MultiCloudOps",
-                                TimeoutSeconds=600,
+                                TimeoutSeconds=900,
                             )
                         except botocore.exceptions.ClientError as e:
                             errors.append(f"{region}: {e.response['Error']['Message']}")
