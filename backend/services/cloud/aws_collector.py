@@ -875,65 +875,80 @@ def collect_costs(session) -> dict:
 
 
 def _parse_patch_output(output: str):
-    """Parse stdout from AWS-RunPatchBaseline to extract patch counts from apt-get output.
-    Ubuntu apt exits with code 1 when upgrades exist, making SSM mark it as Failed,
-    but the output is valid and contains the data we need.
+    """
+    Parse patch scan output. Handles two formats:
+    1. Our custom AWS-RunShellScript structured output (MULTICLOUDOPS_PATCH_SCAN_START marker)
+    2. Raw apt-get output from old AWS-RunPatchBaseline runs (fallback)
+    Returns (missing, installed, failed, patch_state, packages) or None.
     """
     import re
     if not output:
         return None
     missing = installed = failed = 0
+    packages = []
     found = False
 
-    # "N packages can be upgraded"
-    m = re.search(r'(\d+) packages? can be upgraded', output)
-    if m:
-        missing = int(m.group(1))
-        found = True
+    # Format 1: structured output from our custom scan script
+    if "MULTICLOUDOPS_PATCH_SCAN_START" in output:
+        m = re.search(r'MISSING_COUNT=(\d+)', output)
+        if m:
+            missing = int(m.group(1))
+            found = True
+        m2 = re.search(r'INSTALLED_COUNT=(\d+)', output)
+        if m2:
+            installed = int(m2.group(1))
+        m3 = re.search(r'MISSING_PACKAGES=([^\n]*)', output)
+        if m3:
+            pkgs = m3.group(1).strip().rstrip(',')
+            packages = [p.strip() for p in pkgs.split(',') if p.strip()]
 
-    # "0 upgraded, 0 newly installed, 0 to remove and N not upgraded"
-    m2 = re.search(r'and (\d+) not upgraded', output)
-    if m2 and not missing:
-        missing = int(m2.group(1))
-        found = True
-
-    # "N upgraded, N newly installed"
-    m3 = re.search(r'(\d+) upgraded,\s*(\d+) newly installed', output)
-    if m3:
-        installed = int(m3.group(1)) + int(m3.group(2))
-        found = True
+    # Format 2: raw apt-get output (old AWS-RunPatchBaseline fallback)
+    if not found:
+        m = re.search(r'(\d+) packages? can be upgraded', output)
+        if m:
+            missing = int(m.group(1))
+            found = True
+        m2 = re.search(r'and (\d+) not upgraded', output)
+        if m2 and not missing:
+            missing = int(m2.group(1))
+            found = True
+        m3 = re.search(r'(\d+) upgraded,\s*(\d+) newly installed', output)
+        if m3:
+            installed = int(m3.group(1)) + int(m3.group(2))
+            found = True
 
     if not found:
         return None
-
     patch_state = "compliant" if missing == 0 else "non_compliant"
-    return missing, installed, failed, patch_state
+    return missing, installed, failed, patch_state, packages
 
 
 def _patch_state_from_command_output(ssm, iid: str):
-    """Read the most recent AWS-RunPatchBaseline command output for this instance
-    and parse it to determine patch state. This is the only reliable method for
-    Ubuntu instances where Patch Manager doesn't store results."""
-    try:
-        resp = ssm.list_command_invocations(
-            InstanceId=iid,
-            Filters=[{"key": "DocumentName", "value": "AWS-RunPatchBaseline"}],
-            Details=True,
-            MaxResults=5,
-        )
-        invocations = sorted(
-            resp.get("CommandInvocations", []),
-            key=lambda x: x.get("RequestedDateTime", ""),
-            reverse=True,
-        )
-        for inv in invocations:
-            for plugin in inv.get("CommandPlugins", []):
-                output = plugin.get("Output", "") or plugin.get("StandardOutputContent", "")
-                parsed = _parse_patch_output(output)
-                if parsed is not None:
-                    return parsed
-    except Exception:
-        pass
+    """Read the most recent patch scan command output for this instance.
+    Checks both our custom AWS-RunShellScript scan and the old AWS-RunPatchBaseline."""
+    for doc_name in ("AWS-RunShellScript", "AWS-RunPatchBaseline"):
+        try:
+            resp = ssm.list_command_invocations(
+                InstanceId=iid,
+                Filters=[{"key": "DocumentName", "value": doc_name}],
+                Details=True,
+                MaxResults=5,
+            )
+            invocations = sorted(
+                resp.get("CommandInvocations", []),
+                key=lambda x: x.get("RequestedDateTime", ""),
+                reverse=True,
+            )
+            for inv in invocations:
+                # Only use successful commands (our script always exits 0)
+                # but also try Failed ones as fallback (old RunPatchBaseline)
+                for plugin in inv.get("CommandPlugins", []):
+                    output = plugin.get("Output", "") or plugin.get("StandardOutputContent", "")
+                    parsed = _parse_patch_output(output)
+                    if parsed is not None:
+                        return parsed
+        except Exception:
+            continue
     return None
 
 
@@ -998,7 +1013,7 @@ def collect_ssm(session, region: str) -> list:
                 if patch_state == "unknown":
                     parsed = _patch_state_from_command_output(ssm, iid)
                     if parsed is not None:
-                        missing_patches, installed_patches, failed_patches, patch_state = parsed
+                        missing_patches, installed_patches, failed_patches, patch_state, _ = parsed
 
                 # Software inventory
                 software = []

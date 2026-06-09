@@ -402,19 +402,56 @@ async def run_patch_scan(account_id: str, db: AsyncSession = Depends(get_db)):
                         # Silently skip — having no instances in a region is normal
                         continue
 
-                    # Send scan command in batches of 50 (AWS hard limit)
+                    # Custom patch scan script — always exits 0 so SSM marks Success.
+                    # AWS-RunPatchBaseline fails on Ubuntu because apt exits 1 when
+                    # upgrades exist, which SSM misreads as a script error.
+                    # This script outputs structured data we parse in the collector.
+                    PATCH_SCAN_SCRIPT = r"""#!/bin/bash
+set -o pipefail
+echo "MULTICLOUDOPS_PATCH_SCAN_START"
+
+# Detect package manager
+if command -v apt-get &>/dev/null; then
+    PKG_MGR="apt"
+    apt-get update -qq 2>/dev/null || true
+    UPGRADABLE=$(apt list --upgradable 2>/dev/null | grep -c "upgradable" || true)
+    INSTALLED=$(dpkg -l 2>/dev/null | grep -c "^ii" || echo 0)
+    PKGS=$(apt list --upgradable 2>/dev/null | grep "upgradable" | awk -F/ '{print $1}' | tr '\n' ',' || true)
+elif command -v yum &>/dev/null; then
+    PKG_MGR="yum"
+    UPGRADABLE=$(yum check-update --quiet 2>/dev/null | grep -c "^[a-zA-Z]" || true)
+    INSTALLED=$(rpm -qa 2>/dev/null | wc -l || echo 0)
+    PKGS=$(yum check-update --quiet 2>/dev/null | grep "^[a-zA-Z]" | awk '{print $1}' | tr '\n' ',' || true)
+elif command -v dnf &>/dev/null; then
+    PKG_MGR="dnf"
+    UPGRADABLE=$(dnf check-update --quiet 2>/dev/null | grep -c "^[a-zA-Z]" || true)
+    INSTALLED=$(rpm -qa 2>/dev/null | wc -l || echo 0)
+    PKGS=$(dnf check-update --quiet 2>/dev/null | grep "^[a-zA-Z]" | awk '{print $1}' | tr '\n' ',' || true)
+else
+    PKG_MGR="unknown"
+    UPGRADABLE=0
+    INSTALLED=0
+    PKGS=""
+fi
+
+echo "PKG_MGR=$PKG_MGR"
+echo "MISSING_COUNT=$UPGRADABLE"
+echo "INSTALLED_COUNT=$INSTALLED"
+echo "MISSING_PACKAGES=$PKGS"
+echo "MULTICLOUDOPS_PATCH_SCAN_END"
+exit 0
+"""
+
                     for i in range(0, len(instance_ids), 50):
                         batch = instance_ids[i:i+50]
                         cmd_resp = None
-
-                        # Try AWS-RunPatchBaseline with only valid Scan parameters
                         try:
                             cmd_resp = ssm_client.send_command(
                                 InstanceIds=batch,
-                                DocumentName="AWS-RunPatchBaseline",
-                                Parameters={"Operation": ["Scan"]},
-                                Comment="Patch scan by MultiCloudOps",
-                                TimeoutSeconds=900,
+                                DocumentName="AWS-RunShellScript",
+                                Parameters={"commands": [PATCH_SCAN_SCRIPT]},
+                                Comment="MultiCloudOps patch scan",
+                                TimeoutSeconds=300,
                             )
                         except botocore.exceptions.ClientError as e:
                             errors.append(f"{region}: {e.response['Error']['Message']}")
